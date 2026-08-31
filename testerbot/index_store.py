@@ -121,6 +121,53 @@ class IndexStore:
         self.db.commit()
         return new
 
+    # Domains that are almost never worth crawling for a link index: they link
+    # out to everything, so they add noise and eat the whole crawl budget.
+    SKIP_DOMAINS = {
+        "facebook.com", "twitter.com", "x.com", "instagram.com", "linkedin.com",
+        "youtube.com", "youtu.be", "tiktok.com", "pinterest.com", "reddit.com",
+        "google.com", "gstatic.com", "googleapis.com", "gravatar.com",
+        "wordpress.org", "w3.org", "schema.org", "cloudflare.com", "jsdelivr.net",
+        "unpkg.com", "cdnjs.com", "fontawesome.com", "apple.com", "microsoft.com",
+        "amazon.com", "wikipedia.org", "archive.org", "github.io",
+    }
+
+    def frontier(self, limit: int = 20, min_referring: int = 1,
+                 skip: Optional[Iterable[str]] = None) -> List[Tuple[str, int, str]]:
+        """Domains the index has seen linked to but has never crawled.
+
+        Ranked by how many distinct domains link to them, so the most
+        referenced - and so most likely to matter - come first. This is what
+        turns a one-off crawl into an index that keeps growing: each run
+        crawls part of the frontier, which reveals a new frontier.
+        """
+        blocked = set(self.SKIP_DOMAINS)
+        if skip:
+            blocked |= {s.strip().lower() for s in skip if s.strip()}
+        # MIN(target_url) gives a real address we have actually seen linked to,
+        # so the crawl keeps the scheme (and port) the link used instead of
+        # guessing https:// and failing on an http-only host.
+        rows = self.db.execute(
+            "SELECT e.target_domain, COUNT(DISTINCT e.source_domain) AS refdoms, "
+            "MIN(e.target_url) "
+            "FROM edges e JOIN domains d ON d.domain = e.target_domain "
+            "WHERE e.internal = 0 AND d.crawled = 0 AND e.target_domain != '' "
+            "GROUP BY e.target_domain HAVING refdoms >= ? "
+            "ORDER BY refdoms DESC, e.target_domain LIMIT ?",
+            (min_referring, limit + len(blocked))).fetchall()
+        out = [(d, n, u) for d, n, u in rows if d not in blocked]
+        return out[:limit]
+
+    def frontier_size(self, min_referring: int = 1) -> int:
+        """How many uncrawled domains are waiting, in total."""
+        row = self.db.execute(
+            "SELECT COUNT(*) FROM (SELECT e.target_domain "
+            "FROM edges e JOIN domains d ON d.domain = e.target_domain "
+            "WHERE e.internal = 0 AND d.crawled = 0 AND e.target_domain != '' "
+            "GROUP BY e.target_domain HAVING COUNT(DISTINCT e.source_domain) >= ?)",
+            (min_referring,)).fetchone()
+        return row[0] if row else 0
+
     def set_meta(self, key: str, value: str) -> None:
         self.db.execute(
             "INSERT INTO meta(key,value) VALUES(?,?) "
