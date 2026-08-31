@@ -58,6 +58,20 @@ def main(argv=None) -> int:
     p.add_argument("--headed", dest="headless", action="store_false", default=True)
     p.add_argument("--no-crawl", action="store_true",
                    help="Skip crawling; just recompute authority + dashboard from the DB")
+
+    g = p.add_argument_group("keep growing on its own")
+    g.add_argument("--expand", type=int, metavar="N",
+                   help="After the seeds, also crawl the N most-linked domains the index "
+                        "has discovered but never visited. Run it again and again and the "
+                        "index keeps reaching further out")
+    g.add_argument("--min-links", type=int, default=2, metavar="N",
+                   help="Only expand into a domain once at least N different domains link "
+                        "to it (default 2) - keeps one-off mentions out of the crawl")
+    g.add_argument("--time-budget", type=int, metavar="MINUTES",
+                   help="Stop starting new domains after this many minutes. For scheduled "
+                        "runs, so a nightly crawl never overruns")
+    g.add_argument("--skip-domain", action="append", default=[], metavar="DOMAIN",
+                   help="Never expand into this domain (repeatable)")
     p.add_argument("--version", action="version", version=f"TesterBot Index {__version__}")
     args = p.parse_args(argv)
 
@@ -67,10 +81,29 @@ def main(argv=None) -> int:
             seeds += [norm_seed(line) for line in fh]
     seeds = [s for s in seeds if s]
 
+    if args.expand and args.ignore_robots:
+        p.error("--expand crawls sites that are not yours, so robots.txt must be "
+                "respected. Drop --ignore-robots.")
+
     store = IndexStore(args.db)
     print(f"TesterBot Index v{__version__}")
     print(f"  index db : {store.path}")
-    print(f"  domains  : {len(seeds)} to crawl")
+
+    expanded = []
+    if args.expand:
+        waiting = store.frontier_size(args.min_links)
+        already = {registrable(s.split("//")[-1].split("/")[0]) for s in seeds}
+        found = store.frontier(args.expand, args.min_links, args.skip_domain)
+        expanded = [(dom, url) for dom, _n, url in found if dom not in already]
+        seeds += [url for _dom, url in expanded]
+        print(f"  frontier : {waiting} domains discovered and not yet crawled, "
+              f"taking {len(expanded)}")
+
+    print(f"  domains  : {len(seeds)} to crawl"
+          + (f" ({len(seeds) - len(expanded)} seeds + {len(expanded)} from the frontier)"
+             if expanded else ""))
+    if args.time_budget:
+        print(f"  budget   : {args.time_budget} min")
     print("  Only crawl sites you own or are authorised to crawl.\n")
 
     if seeds and not args.no_crawl:
@@ -86,7 +119,12 @@ def main(argv=None) -> int:
             else:
                 print("  respecting robots.txt · UA: TesterBotIndex/2.0")
             context.set_default_navigation_timeout(cfg.nav_timeout_ms)
+            deadline = (time.time() + args.time_budget * 60) if args.time_budget else None
             for i, seed in enumerate(seeds, 1):
+                if deadline and time.time() > deadline:
+                    print(f"  time budget spent - stopping with {len(seeds) - i + 1} "
+                          f"domains left for the next run", flush=True)
+                    break
                 dom = registrable(seed.split("//")[-1].split("/")[0])
                 print(f"[{i}/{len(seeds)}] crawling {dom} …", flush=True)
                 graph = LinkGraph(seed, args.allow_subdomains)
@@ -128,6 +166,10 @@ def main(argv=None) -> int:
         print(f"   {flag} DA {r['authority']:3}  {r['referring_domains']:3} refdom  "
               f"{r['domain']}")
     print("-" * 64)
+    waiting = store.frontier_size(args.min_links)
+    if waiting:
+        print(f"  Frontier: {waiting} more domains discovered, not yet crawled")
+        print(f"            run again with --expand N to reach them")
     print(f"  Dashboard: {html_path}")
     print(f"  Index DB : {store.path}")
     print("=" * 64)

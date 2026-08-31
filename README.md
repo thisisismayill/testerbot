@@ -420,6 +420,77 @@ and the rest.
 
 ---
 
+## 8a. Letting the index grow by itself (since v2.1)
+
+Index mode crawls the domains you name. It also *records* every other domain
+those pages link out to — but until now it never went and looked at them. So the
+index only ever knew what you had already thought to type in.
+
+`--expand` closes that loop:
+
+```bash
+# crawl 20 of the most-linked domains the index has found but never visited
+python3 tb_index.py --expand 20
+```
+
+Each run reaches one ring further out. Run it again and the domains discovered
+last time become the ones crawled this time:
+
+```
+run 1  seed: hub.example                    →  2 domains,  5 links
+run 2  --expand                             →  3 domains, 13 links
+run 3  --expand                             →  3 domains, 19 links
+```
+
+The frontier is ordered by **how many different domains link to a candidate**, so
+the crawl spends its time on pages the web itself considers worth pointing at,
+not on whatever happened to be first alphabetically. `--min-links 3` raises that
+bar; a domain mentioned once by one site is usually noise.
+
+Two things it will not do. It never expands into the big link sinks — Facebook,
+YouTube, Wikipedia, CDNs — because they link out to everything and would eat the
+whole budget; `--skip-domain` adds your own. And `--expand` refuses to run with
+`--ignore-robots`, because expanding means crawling sites that are not yours, and
+on those, `robots.txt` is not optional.
+
+### Running it on a schedule
+
+```bash
+# a night's work, then stop cleanly whatever it has reached
+python3 tb_index.py --expand 200 --min-links 2 --time-budget 420 \
+    --db ~/testerbot/index.db --out ~/testerbot/dashboard
+```
+
+`--time-budget` is in minutes and is checked between domains, so the run always
+finishes the domain it is on and never leaves half a site in the index.
+
+On macOS, `crontab -e` and add one line to run it at 02:00 every night:
+
+```
+0 2 * * * cd ~/testerbot && ./venv/bin/python tb_index.py --expand 200 --time-budget 420 >> ~/testerbot/crawl.log 2>&1
+```
+
+Be honest with yourself about where it runs. On a laptop it crawls while the lid
+is open and stops when it is not; that is fine for building a picture of a few
+thousand domains in your own field. A round-the-clock index needs a machine that
+stays on.
+
+### What to expect
+
+Roughly one to two seconds per page, most of it the politeness delay and the
+site's own response time. At the default 25 pages per domain that is about half
+a minute per domain, so an overnight run reaches a few hundred domains. The
+SQLite index handles millions of links comfortably.
+
+This is a picture of a neighbourhood, not a copy of the web. Pointed at the two
+hundred sites that matter in your field it will tell you who really links to
+whom — which is the question you actually have. Pointed at "the internet" it
+will run forever and finish nothing.
+
+The data lives in your SQLite file. Nothing is sent anywhere.
+
+---
+
 ## 9. File structure
 
 ```
