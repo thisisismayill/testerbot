@@ -1,0 +1,59 @@
+# TesterBot example configuration
+#   python3 tester_bot.py --config config.example.yaml
+# Every key here can also be passed on the command line (the command line wins).
+
+url: "https://your-site.com"
+
+# ---------- scope ----------
+max_pages: 60            # how many pages to walk at most
+max_depth: 3             # how many clicks deep from the home page
+allow_subdomains: false  # also test subdomains like blog.site.com?
+use_sitemap: true        # pull extra pages from sitemap.xml?
+exclude:                 # never visit URLs matching these regexes
+  - "/admin/danger"
+  - "\\?print=1"
+include: []              # if set, ONLY URLs matching these regexes are tested
+extra_urls:              # add pages that are not reachable by a link
+  - "https://your-site.com/dashboard"
+
+# ---------- login ----------
+login_url: "https://your-site.com/login"
+username: "test@your-site.com"
+# password: do NOT write it here - use the TESTERBOT_PASS environment variable
+# user_selector: "#email"        # point it here if auto-detection fails
+# pass_selector: "#password"
+# submit_selector: "button.login"
+login_success_url: "/dashboard"  # the marker that confirms the sign-in worked
+# login_success_text: "Sign out"
+save_storage_state: "session.json"   # save the session (reuse later with storage_state)
+
+# ---------- behaviour ----------
+click_elements: true     # click buttons and menus
+submit_forms: true       # fill forms with test data and submit them
+max_clicks_per_page: 25
+max_forms_per_page: 4
+danger_mode: false       # true = also touches delete/payment buttons. STAGING ONLY!
+check_external_links: true
+run_axe: true            # the axe-core accessibility audit
+hygiene_checks: true     # files left exposed, like /.env and /.git
+responsive_checks: true
+
+# ---------- site intelligence ----------
+run_intelligence: true    # authority + performance + technology + hosting
+run_performance: true     # PageSpeed (the slowest part — you can turn it off)
+# opr_key: "..."          # OpenPageRank key (free: domcop.com/openpagerank)
+                          # better still: the TESTERBOT_OPR_KEY environment variable
+# psi_key: "..."          # Google PageSpeed key (optional)
+
+# ---------- browser ----------
+headless: true           # false = show the browser window
+timeout_ms: 30000
+nav_timeout_ms: 45000
+settle_ms: 1200          # extra wait for SPAs like React/Vue
+viewport_width: 1440
+viewport_height: 900
+# ignore_https_errors: true   # for staging with a self-signed certificate
+
+# ---------- report ----------
+out_dir: "testerbot-report"
+screenshot_all: false

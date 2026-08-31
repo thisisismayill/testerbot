@@ -1,0 +1,16 @@
+# runtime output — reports contain the URLs and screenshots of whatever you tested
+reports/
+*.db
+.testerbot-ui.json
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# editors / OS
+.DS_Store
+.idea/
+.vscode/
