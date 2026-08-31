@@ -1,0 +1,3 @@
+Technology fingerprint dataset derived from the Wappalyzer MIT-era ruleset
+as redistributed by the simple-wappalyzer package (MIT License, (c) Kiko Beats).
+Used for offline technology detection. See https://github.com/Kikobeats/simple-wappalyzer
