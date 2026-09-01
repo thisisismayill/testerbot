@@ -143,14 +143,21 @@ class TesterBot:
 
             # ---------- site-level checks
             self.log("→ site-level checks (HTTPS, 404, robots, sitemap)")
+            # If the site turns us away, every "X is missing" check below would
+            # only be measuring the refusal. Say so once, then stop claiming
+            # things are absent when we were never allowed to look.
+            blocked, block_findings = site.check_reachable(request, self.base_url)
+            self.add(block_findings)
+            if blocked:
+                self.log("   ⚠ the site refused us — the checks below cannot be trusted")
             self.add(site.check_https(request, self.base_url))
             self.add(site.check_404(request, self.base_url))
             if cfg.hygiene_checks:
-                self.add(site.check_hygiene(request, self.base_url))
+                self.add(site.check_hygiene(request, self.base_url, blocked=blocked))
             seeds: List[str] = []
             if cfg.use_sitemap:
                 sm_urls, sm_findings = site.discover_sitemap_urls(
-                    request, self.base_url, cfg, self.log)
+                    request, self.base_url, cfg, self.log, blocked=blocked)
                 self.add(sm_findings)
                 seeds = sm_urls[: cfg.max_pages]
 

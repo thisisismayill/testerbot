@@ -39,22 +39,77 @@ def fetch(request, url: str, method: str = "GET", timeout: int = 15000):
         return None
 
 
+def _verdict(resp) -> Tuple[str, Optional[int]]:
+    """What a probe actually proves.
+
+    Absence is only ever proven by 404/410. A refusal (401/403), a rate limit
+    (429), a server error or a timeout all mean *we could not look* - a
+    different statement. Reporting those as "not found" invents a problem the
+    site does not have, and sends someone off to fix a file that is already
+    there, so the two cases are kept apart everywhere below.
+    """
+    if resp is None:
+        return "unreachable", None
+    if resp.status in (404, 410):
+        return "missing", resp.status
+    if resp.status < 400:
+        return "present", resp.status
+    return "blocked", resp.status
+
+
+def check_reachable(request, base_url: str) -> Tuple[bool, List[Finding]]:
+    """Does the site answer us at all? Returns (blocked, findings).
+
+    When the answer is no, every later 'X is missing' check would only be
+    measuring the block, so the caller stops asking them.
+    """
+    resp = fetch(request, origin(base_url) + "/")
+    state, status = _verdict(resp)
+    if state != "blocked":
+        return False, []
+    return True, [Finding(
+        severity="high", category="HTTP Status",
+        title=f"The site refused TesterBot (HTTP {status}) - this report is incomplete",
+        detail=(
+            f"Every request came back {status}, including plain files like /robots.txt. "
+            "The site itself is probably fine - it is this client that is being turned "
+            "away, usually by a CDN, WAF, bot protection or a rate limit that reacts to "
+            "an automated browser. Nothing below this line was actually measured."),
+        url=origin(base_url) + "/", evidence={"status": status},
+        how_to_fix=(
+            "Allow your own testing while a run is in progress: allow-list your IP in the "
+            "CDN or firewall, or use the host's testing bypass. If the block is a rate "
+            "limit it clears by itself - wait and run again."))]
+
+
 # ------------------------------------------------------------------ sitemap
 
 def discover_sitemap_urls(request, base_url: str, cfg: Config,
-                          log) -> Tuple[List[str], List[Finding]]:
+                          log, blocked: bool = False) -> Tuple[List[str], List[Finding]]:
     findings: List[Finding] = []
     urls: List[str] = []
     root = origin(base_url)
 
     robots = fetch(request, root + "/robots.txt")
+    robots_state, robots_status = _verdict(robots)
     sitemap_refs: List[str] = []
-    if robots is None or robots.status >= 400:
+    if robots_state == "missing":
         findings.append(Finding(
             severity="info", category="Site Hygiene",
             title="No robots.txt", url=root + "/robots.txt",
             detail="Crawlers get no guidance about what to index.",
             how_to_fix="Add a robots.txt (even an allow-all one) and reference your sitemap."))
+    elif robots_state != "present":
+        if not blocked:
+            findings.append(Finding(
+                severity="info", category="Site Hygiene",
+                title="Could not check robots.txt", url=root + "/robots.txt",
+                detail=(f"The server answered {robots_status} instead of the file. It may well "
+                        "exist - this run simply could not read it."
+                        if robots_status else
+                        "The request did not complete, so this run could not read the file."),
+                evidence={"status": robots_status} if robots_status else {},
+                how_to_fix="Open the address in a browser to see whether the file is there."))
     else:
         try:
             body = robots.text()
@@ -72,9 +127,13 @@ def discover_sitemap_urls(request, base_url: str, cfg: Config,
 
     candidates = sitemap_refs or [root + "/sitemap.xml", root + "/sitemap_index.xml"]
     found_any = False
+    sitemap_blocked: Optional[int] = None   # a refusal, not a 404: we could not look
     for sm in candidates[:5]:
         resp = fetch(request, sm)
-        if resp is None or resp.status >= 400:
+        sm_state, sm_status = _verdict(resp)
+        if sm_state != "present":
+            if sm_state == "blocked" and sitemap_blocked is None:
+                sitemap_blocked = sm_status
             continue
         try:
             xml = resp.text()
@@ -94,13 +153,21 @@ def discover_sitemap_urls(request, base_url: str, cfg: Config,
             n = normalise(loc)
             if n and same_scope(n, base_url, cfg.allow_subdomains) and not n.lower().endswith(".xml"):
                 urls.append(n)
-    if not found_any:
+    if not found_any and not blocked and not sitemap_blocked:
         findings.append(Finding(
             severity="low", category="Site Hygiene",
             title="No sitemap.xml found", url=root + "/sitemap.xml",
             detail="Search engines have to discover pages by crawling links only.",
             how_to_fix="Publish a sitemap.xml and link it from robots.txt."))
-    else:
+    elif not found_any and sitemap_blocked and not blocked:
+        findings.append(Finding(
+            severity="info", category="Site Hygiene",
+            title="Could not check sitemap.xml", url=root + "/sitemap.xml",
+            detail=(f"The server answered {sitemap_blocked} instead of the file. A sitemap may "
+                    "well be published - this run could not read it."),
+            evidence={"status": sitemap_blocked},
+            how_to_fix="Open the address in a browser to see whether the file is there."))
+    elif found_any:
         log(f"  sitemap: {len(set(urls))} URLs discovered")
     seen: Set[str] = set()
     ordered = []
@@ -161,7 +228,7 @@ def check_https(request, base_url: str) -> List[Finding]:
     return out
 
 
-def check_hygiene(request, base_url: str) -> List[Finding]:
+def check_hygiene(request, base_url: str, blocked: bool = False) -> List[Finding]:
     """Look for files that are commonly left exposed by accident on one's own server."""
     out: List[Finding] = []
     root = origin(base_url)
@@ -170,7 +237,8 @@ def check_hygiene(request, base_url: str) -> List[Finding]:
         if resp is None:
             continue
         if path == "/.well-known/security.txt":
-            if resp.status >= 400:
+            state, _status = _verdict(resp)
+            if state == "missing" and not blocked:
                 out.append(Finding(
                     severity="info", category="Site Hygiene",
                     title="No security.txt", url=root + path,
