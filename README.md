@@ -417,6 +417,7 @@ and the rest.
 | The report is full of "Low/Info" | click the **Critical** or **High** tile in the report — only those remain |
 | The bot takes too long | `--max-pages 25 --no-external-links --no-axe` |
 | I do not want forms submitted | `--no-forms` |
+| Every page comes back **403** | the host is turning the bot away, not the site being broken — see 8b |
 
 ---
 
@@ -488,6 +489,58 @@ whom — which is the question you actually have. Pointed at "the internet" it
 will run forever and finish nothing.
 
 The data lives in your SQLite file. Nothing is sent anywhere.
+
+---
+
+## 8b. When the host blocks the bot (403 on everything)
+
+Some sites answer every request from TesterBot with **403**, including plain files
+like `/robots.txt`. The site is fine; the CDN or firewall in front of it is
+refusing this particular client.
+
+You can tell this apart from a real problem in about ten seconds. From the same
+machine, ask for the same URL with a simple tool:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" https://your-site.com/
+```
+
+If `curl` says `200` and TesterBot says `403`, nothing is wrong with the site.
+The block is aimed at the *automated browser*, and it is invisible to you because
+your own Chrome passes and `curl` is waved through as a harmless script.
+
+This is common and it is not a bug you can fix from the client side. Vercel's
+managed mitigations, Cloudflare's bot protection, AWS WAF and similar systems all
+fingerprint an automated browser and challenge it; a headless browser cannot pass
+the challenge, so it gets a 403 every time. Waiting does not help — the
+fingerprint does not change.
+
+**The honest fix is to let your own tool in, on your own site.** You own the
+firewall, so allow yourself through it while you test:
+
+- **Vercel** — Project → Firewall → Add New → allow your own IP address.
+- **Cloudflare** — Security → WAF → create a rule skipping bot protection for
+  your IP.
+- Most other hosts have the same idea under a different name: an allow-list, a
+  bypass token, or a "testing" mode.
+
+Do this only on infrastructure you control. Trying to slip past someone else's
+bot protection is a different act with a different name, and TesterBot will not
+help you do it.
+
+**What TesterBot does about it.** Since v2.1.2 the report says so plainly:
+
+```
+[HIGH] The site refused TesterBot (HTTP 403) - this report is incomplete
+```
+
+and — this is the part that matters — it stops making claims it cannot support.
+Absence is only ever proven by a `404`. A refusal, a rate limit, a timeout or a
+server error mean *the check could not be made*, which is a different sentence.
+Before v2.1.2 a blocked run reported "No robots.txt" and "No sitemap.xml found"
+on a site that published both, which is worse than saying nothing: it sends you
+off to fix a file that is already there. Now those come back as "Could not check
+robots.txt", or are left out entirely when the whole site is refusing.
 
 ---
 
