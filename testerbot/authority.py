@@ -14,6 +14,16 @@ import math
 from collections import defaultdict
 from typing import Any, Dict, List, Tuple
 
+from .urls import is_utility
+from .topic import TopicFilter
+
+# A domain that one other domain links to has not been measured, it has been
+# glimpsed. Scoring it anyway produces confident-looking numbers with nothing
+# underneath - the fastest way for an index to lose the reader's trust. Such
+# domains stay in the graph and keep their score; they are simply not offered
+# as a ranking until the evidence is there.
+MIN_REFDOMS_TO_RANK = 2
+
 
 def pagerank(edges: List[Tuple[str, str, int]], damping: float = 0.85,
              iterations: int = 60, tol: float = 1e-9) -> Dict[str, float]:
@@ -85,6 +95,11 @@ def build_leaderboard(store) -> Dict[str, Any]:
     crawled = set(
         r[0] for r in store.db.execute(
             "SELECT domain FROM domains WHERE crawled=1").fetchall())
+    try:
+        offtopic = set(r[0] for r in store.db.execute(
+            "SELECT domain FROM domains WHERE COALESCE(offtopic,0)=1").fetchall())
+    except Exception:
+        offtopic = set()
 
     domains = set(pr) | set(counts) | set(store.all_domains())
 
@@ -116,6 +131,15 @@ def build_leaderboard(store) -> Dict[str, Any]:
             "referring_domains": c["referring_domains"],
             "backlinks": c["backlinks"],
             "crawled": d in crawled,
+            # kept in the graph, hidden from the default ranking. Two kinds:
+            # the web's plumbing (urls.UTILITY_DOMAINS) and B2B infrastructure
+            # every company links to whatever its business is - job boards,
+            # newswires, code hosts (topic.INFRASTRUCTURE_DOMAINS). Neither says
+            # anything about who matters in a field.
+            "utility": (is_utility(d) or TopicFilter.is_infrastructure(d)
+                        or d in offtopic),
+            # too few referring domains to say anything: see MIN_REFDOMS_TO_RANK
+            "thin": c["referring_domains"] < MIN_REFDOMS_TO_RANK,
         })
     rows.sort(key=lambda r: (r["authority"], r["referring_domains"], r["backlinks"]),
               reverse=True)
@@ -123,4 +147,5 @@ def build_leaderboard(store) -> Dict[str, Any]:
         "leaderboard": rows,
         "stats": store.stats(),
         "computed_over_domains": len(pr),
+        "min_refdoms_to_rank": MIN_REFDOMS_TO_RANK,
     }

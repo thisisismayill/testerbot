@@ -128,6 +128,8 @@ h1 .m{color:var(--accent-ink)}
 .anchor b{color:var(--ink);font-weight:500}
 .anchor .src{font-family:var(--mono);font-size:10.5px;color:var(--faint);display:block;margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .controls{padding:12px 18px;border-bottom:1px solid var(--line-2)}
+.utilrow{display:flex;align-items:center;gap:7px;margin-top:9px;font-size:11.5px;color:var(--faint);cursor:pointer;user-select:none}
+.utilrow input{margin:0;cursor:pointer}
 input[type=search]{width:100%;padding:9px 12px;border:1px solid var(--line);border-radius:9px;
   background:var(--surface-2);color:var(--ink);font-size:14px;font-family:var(--sans)}
 input[type=search]:focus{outline:2px solid var(--accent);outline-offset:-1px}
@@ -169,7 +171,7 @@ footer{margin-top:34px;padding:20px 0 50px;border-top:1px solid var(--line);colo
   <div class="layout">
     <div class="panel">
       <div class="phead"><h2>Domain Authority · ranking</h2><span class="hint">click a domain</span></div>
-      <div class="controls"><input type="search" id="q" placeholder="Search domains…"></div>
+      <div class="controls"><input type="search" id="q" placeholder="Search domains…"><label class="utilrow"><input type="checkbox" id="showutil"><span id="utilnote">show social / CDN domains</span></label><label class="utilrow"><input type="checkbox" id="showthin"><span id="thinnote">show thinly-linked domains</span></label></div>
       <div class="lb" id="lb"></div>
     </div>
     <div class="panel" id="detail">
@@ -203,10 +205,23 @@ const lb = document.getElementById('lb');
 
 function daColor(v){ return v>=60?'var(--good)':(v>=25?'var(--signal)':'var(--muted)'); }
 
+// Every site links to LinkedIn, X and a CDN, so in a focused index those
+// domains outrank the field they are not part of. They stay in the data; the
+// ranking just does not lead with them.
+const UTIL_N = DATA.leaderboard.filter(r=>r.utility).length;
+// A domain one other domain links to has not been measured, only glimpsed.
+// It keeps its score and stays in the graph, but it is not offered as a
+// ranking until there is something behind the number.
+const THIN_N = DATA.leaderboard.filter(r=>r.thin && !r.utility).length;
+function showUtil(){ const b=document.getElementById('showutil'); return b && b.checked; }
+function showThin(){ const b=document.getElementById('showthin'); return b && b.checked; }
 function renderList(filter){
   filter = (filter||'').toLowerCase();
   lb.innerHTML='';
-  DATA.leaderboard.filter(r=>!filter||r.domain.toLowerCase().includes(filter))
+  DATA.leaderboard
+    .filter(r=>showUtil()||!r.utility)
+    .filter(r=>showThin()||!r.thin)
+    .filter(r=>!filter||r.domain.toLowerCase().includes(filter))
     .forEach((r,i)=>{
     const row=document.createElement('div');
     row.className='row'; row.dataset.domain=r.domain;
@@ -320,7 +335,24 @@ function buildIntersect(){
 })();
 
 renderList('');
-if(DATA.leaderboard.length) select(DATA.leaderboard[0].domain);
+const _util = document.getElementById('showutil');
+if(_util){
+  const note = document.getElementById('utilnote');
+  if(note) note.textContent = 'show '+UTIL_N+' social / CDN domain'+(UTIL_N===1?'':'s');
+  if(!UTIL_N && _util.parentElement) _util.parentElement.style.display='none';
+  _util.addEventListener('change', ()=>renderList(document.getElementById('q').value));
+}
+const _thin = document.getElementById('showthin');
+if(_thin){
+  const floor = DATA.min_refdoms_to_rank || 2;
+  const note = document.getElementById('thinnote');
+  if(note) note.textContent = 'show '+THIN_N+' domain'+(THIN_N===1?'':'s')+
+    ' with fewer than '+floor+' referring domains';
+  if(!THIN_N && _thin.parentElement) _thin.parentElement.style.display='none';
+  _thin.addEventListener('change', ()=>renderList(document.getElementById('q').value));
+}
+const _first = DATA.leaderboard.filter(r=>!r.utility && !r.thin)[0] || DATA.leaderboard[0];
+if(_first) select(_first.domain);
 </script>
 </body>
 </html>

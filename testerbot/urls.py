@@ -61,11 +61,67 @@ def registrable(host: str) -> str:
     return ".".join(parts[-2:])
 
 
+def host_key(netloc: str) -> str:
+    """Host as used for scope comparison, with a leading 'www.' removed.
+
+    'www' is not a real subdomain boundary: www.example.com and example.com are
+    the same site by convention, and sites redirect freely between the two. A
+    crawl seeded at the bare domain that lands on the www form would otherwise
+    judge every internal link out of scope and stop after one page. The port is
+    kept, because a different port really is a different site.
+    """
+    host = netloc.lower()
+    return host[4:] if host.startswith("www.") else host
+
+
 def same_scope(url: str, base_url: str, allow_subdomains: bool = False) -> bool:
     a, b = urlparse(url), urlparse(base_url)
     if allow_subdomains:
         return registrable(a.netloc) == registrable(b.netloc)
-    return a.netloc.lower() == b.netloc.lower()
+    return host_key(a.netloc) == host_key(b.netloc)
+
+
+# Domains that sit in the footer of almost every website: social networks,
+# messengers, shorteners, app stores, CDNs. In a web-scale index they rank
+# correctly high. In a focused index they are noise - every site you crawl
+# links to them, so they float to the top of any ranking and push the domains
+# you actually care about off the page. They stay in the graph (removing them
+# would distort the link maths); they are only hidden from the default view.
+UTILITY_DOMAINS = {
+    "facebook.com", "twitter.com", "x.com", "instagram.com", "linkedin.com",
+    "youtube.com", "youtu.be", "tiktok.com", "pinterest.com", "reddit.com",
+    "snapchat.com", "threads.net", "bsky.app", "mastodon.social", "vk.com",
+    "t.me", "telegram.me", "telegram.org", "whatsapp.com", "wa.me", "discord.com", "discord.gg",
+    "bit.ly", "tinyurl.com", "buff.ly", "ow.ly", "lnkd.in", "goo.gl", "t.co",
+    "google.com", "gstatic.com", "googleapis.com", "googletagmanager.com",
+    "doubleclick.net", "gravatar.com", "apple.com", "microsoft.com",
+    "servedbyadbutler.com", "adbutler.com", "adsrvr.org", "criteo.com",
+    "outbrain.com", "taboola.com", "scorecardresearch.com",
+    "amazon.com", "adobe.com", "cloudflare.com", "jsdelivr.net", "unpkg.com",
+    "cdnjs.com", "fontawesome.com", "bootstrapcdn.com", "w3.org", "schema.org",
+    "wordpress.org", "wordpress.com", "wp.com", "gravatar.com",
+    "wikipedia.org", "archive.org", "github.io", "gmail.com", "outlook.com",
+    "play.google.com", "apps.apple.com", "itunes.apple.com",
+    # publishing, podcast and consent platforms every publisher embeds:
+    "spotify.com", "podcasts.apple.com", "soundcloud.com", "vimeo.com",
+    "flickr.com", "beehiiv.com", "substack.com", "medium.com", "ghost.org",
+    "mailchimp.com", "hubspot.com", "onetrust.com", "cookiebot.com",
+    "eventbrite.com", "calendly.com", "typeform.com", "disqus.com",
+    "creativecommons.org", "adobe.com", "oracle.com", "salesforce.com",
+    # cookie banners and privacy notices link to the same handful of pages
+    # from every site that has one:
+    "cookiepedia.co.uk", "aboutcookies.org", "allaboutcookies.org",
+    "aboutads.info", "youronlinechoices.com", "youronlinechoices.eu",
+    "networkadvertising.org", "optout.aboutads.info", "iabeurope.eu",
+    "qualtrics.com", "trustarc.com", "usercentrics.com",
+    # browser vendors, linked from "this site works best in..." notices:
+    "mozilla.org", "opera.com", "firefox.com", "chrome.com", "brave.com",
+}
+
+
+def is_utility(domain: str) -> bool:
+    """True for the plumbing of the web rather than a site in anyone's field."""
+    return host_key(domain or "") in UTILITY_DOMAINS
 
 
 def is_asset(url: str) -> bool:

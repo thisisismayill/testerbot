@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Set
 
 from .config import Config
 from .linkgraph import LinkGraph
-from .urls import normalise, same_scope, is_asset, is_document
+from .urls import normalise, same_scope, is_asset, is_document, shorten
 from .robots import RobotsCache
 
 LINKS_JS = r"""
@@ -29,19 +29,35 @@ LINKS_JS = r"""
       rel: (a.getAttribute('rel') || '').toLowerCase()
     });
   }
-  return { url: location.href, title: (document.title||'').trim().slice(0,200), links: out };
+  const t = (document.body ? (document.body.innerText || '') : '');
+  return { url: location.href, title: (document.title||'').trim().slice(0,200),
+           text: t.slice(0, 6000), links: out };
 }
 """
 
 
 def harvest_domain(context, base_url: str, cfg: Config,
                    graph: LinkGraph, log=None,
-                   robots: "RobotsCache" = None, delay_ms: int = 0) -> Dict[str, Any]:
+                   robots: "RobotsCache" = None, delay_ms: int = 0,
+                   max_seconds: Optional[int] = None,
+                   page_timeout_ms: Optional[int] = None,
+                   topic=None) -> Dict[str, Any]:
     """BFS-crawl one domain for links, feeding the shared LinkGraph.
 
     If `robots` is given, URLs disallowed by robots.txt are skipped and any
     declared crawl-delay is honoured. `delay_ms` adds a politeness pause
     between page fetches.
+
+    `topic`, when given, is checked against the first page that loads. A
+    domain that shows no sign of the subject is abandoned after that one page
+    rather than spending twenty-five on it: this is what stops a focused crawl
+    drifting, one outbound link at a time, into whatever the web links to next.
+
+    `max_seconds` caps how long one domain may hold the crawl. An index is
+    built on breadth: twenty-five pages from a hundred domains says far more
+    about who links to whom than twenty-five pages from twenty. Without a cap a
+    single slow site quietly spends the whole run, and the pages already
+    harvested from it are kept either way.
     """
     page = context.new_page()
     # let the robots cache fetch robots.txt through the browser's network stack
@@ -72,7 +88,15 @@ def harvest_domain(context, base_url: str, cfg: Config,
     skip_re = cfg.skip_url_re()
     t0 = time.time()
 
+    deadline = (t0 + max_seconds) if max_seconds else None
+    out_of_time = False
+    off_topic = False
+    thin_page = False
+    nav_timeout = page_timeout_ms or cfg.nav_timeout_ms
     while queue and pages < cfg.max_pages:
+        if deadline and time.time() > deadline:
+            out_of_time = True
+            break
         url, depth = queue.popleft()
         if url in visited or depth > cfg.max_depth:
             continue
@@ -93,7 +117,7 @@ def harvest_domain(context, base_url: str, cfg: Config,
         if wait and pages > 0:
             page.wait_for_timeout(min(wait, 5000))
         try:
-            page.goto(url, timeout=cfg.nav_timeout_ms, wait_until="domcontentloaded")
+            page.goto(url, timeout=nav_timeout, wait_until="domcontentloaded")
             page.wait_for_timeout(min(cfg.settle_ms, 600))
         except Exception as exc:
             # Keep the first failure. If every page fails the caller has nothing
@@ -107,6 +131,21 @@ def harvest_domain(context, base_url: str, cfg: Config,
             data = page.evaluate(LINKS_JS)
         except Exception:
             continue
+        if topic and pages == 1:
+            body = (data.get("text") or "").strip()
+            sample = f"{data.get('title','')} {url} {body}"
+            # A page that gave us nothing has not told us it is off the subject -
+            # it has told us nothing. Judging silence as a verdict is the same
+            # mistake as reporting a blocked file as missing, and it cost this
+            # index CoinDesk on its first clean run: a consent wall rendered no
+            # text, so a central crypto publication was written off. The bar is
+            # deliberately at the floor - a real page clears it easily, and only
+            # an empty one does not.
+            if len(body) < 60:
+                thin_page = True
+            elif not topic.matches(sample):
+                off_topic = True
+                break
         graph.note_page(url)
         for link in data.get("links", []):
             href = link.get("href", "")
@@ -114,12 +153,15 @@ def harvest_domain(context, base_url: str, cfg: Config,
             n = normalise(href, url)
             if n and same_scope(n, base_url, cfg.allow_subdomains) and n not in visited:
                 queue.append((n, depth + 1))
-        if log and pages % 5 == 0:
-            log(f"    {pages} pages · {base_url}")
+        if log:
+            log(f"    {pages}/{cfg.max_pages} · {int(time.time() - t0)}s · "
+                f"{len(graph.edges)} links · {shorten(url, 58)}")
 
     try:
         page.close()
     except Exception:
         pass
     return {"pages": pages, "blocked": blocked, "error": first_error,
+            "out_of_time": out_of_time, "off_topic": off_topic,
+            "thin_page": thin_page,
             "seconds": round(time.time() - t0, 1)}

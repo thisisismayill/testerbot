@@ -15,14 +15,17 @@ import sqlite3
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from .urls import normalise, registrable
+from .urls import normalise, registrable, UTILITY_DOMAINS
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS domains (
     domain      TEXT PRIMARY KEY,
     first_seen  INTEGER,
     last_seen   INTEGER,
-    crawled     INTEGER DEFAULT 0      -- 1 if we actually fetched this domain's pages
+    crawled     INTEGER DEFAULT 0,     -- 1 only if we actually fetched pages from it
+    attempts    INTEGER DEFAULT 0,     -- failed tries; a domain we could not reach is
+    last_error  TEXT,                  -- not finished, it is owed another attempt
+    offtopic    INTEGER DEFAULT 0      -- looked at once, not about this subject
 );
 CREATE TABLE IF NOT EXISTS pages (
     url         TEXT PRIMARY KEY,
@@ -62,6 +65,13 @@ class IndexStore:
         self.db = sqlite3.connect(self.path)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
+        # databases created before failure tracking existed
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(domains)")}
+        for col, ddl in (("attempts", "ALTER TABLE domains ADD COLUMN attempts INTEGER DEFAULT 0"),
+                         ("last_error", "ALTER TABLE domains ADD COLUMN last_error TEXT"),
+                         ("offtopic", "ALTER TABLE domains ADD COLUMN offtopic INTEGER DEFAULT 0")):
+            if col not in cols:
+                self.db.execute(ddl)
         self.db.commit()
 
     # ------------------------------------------------------------------ writes
@@ -70,6 +80,45 @@ class IndexStore:
         self.db.execute(
             "INSERT INTO domains(domain,first_seen,last_seen,crawled) VALUES(?,?,?,1) "
             "ON CONFLICT(domain) DO UPDATE SET last_seen=?, crawled=1",
+            (domain, now, now, now))
+        self.db.commit()
+
+    MAX_ATTEMPTS = 3   # after this many failures a domain stops using crawl budget
+
+    def mark_failed(self, domain: str, error: str = "",
+                    now: Optional[int] = None) -> int:
+        """Record that a domain could not be crawled, and return the attempt count.
+
+        Marking a failure as 'crawled' would quietly retire the domain: the
+        frontier would never offer it again and the index would be missing it
+        forever, with nothing in the output to say so. A domain we could not
+        reach is unfinished, not done.
+        """
+        now = now or int(time.time())
+        self.db.execute(
+            "INSERT INTO domains(domain,first_seen,last_seen,crawled,attempts,last_error) "
+            "VALUES(?,?,?,0,1,?) "
+            "ON CONFLICT(domain) DO UPDATE SET last_seen=?, "
+            "attempts=COALESCE(attempts,0)+1, last_error=?",
+            (domain, now, now, error[:300], now, error[:300]))
+        self.db.commit()
+        row = self.db.execute("SELECT attempts FROM domains WHERE domain=?",
+                              (domain,)).fetchone()
+        return row[0] if row else 1
+
+    def mark_offtopic(self, domain: str, now: Optional[int] = None) -> None:
+        """This domain was reached and is not about the subject.
+
+        Unlike a failure it is not owed another attempt - we looked, and the
+        answer will not change - so it leaves the frontier for good and stops
+        costing crawl budget. It stays in the graph: it is still a real link
+        target, just not somewhere this index goes deeper.
+        """
+        now = now or int(time.time())
+        self.db.execute(
+            "INSERT INTO domains(domain,first_seen,last_seen,crawled,offtopic) "
+            "VALUES(?,?,?,0,1) "
+            "ON CONFLICT(domain) DO UPDATE SET last_seen=?, offtopic=1",
             (domain, now, now, now))
         self.db.commit()
 
@@ -123,17 +172,13 @@ class IndexStore:
 
     # Domains that are almost never worth crawling for a link index: they link
     # out to everything, so they add noise and eat the whole crawl budget.
-    SKIP_DOMAINS = {
-        "facebook.com", "twitter.com", "x.com", "instagram.com", "linkedin.com",
-        "youtube.com", "youtu.be", "tiktok.com", "pinterest.com", "reddit.com",
-        "google.com", "gstatic.com", "googleapis.com", "gravatar.com",
-        "wordpress.org", "w3.org", "schema.org", "cloudflare.com", "jsdelivr.net",
-        "unpkg.com", "cdnjs.com", "fontawesome.com", "apple.com", "microsoft.com",
-        "amazon.com", "wikipedia.org", "archive.org", "github.io",
-    }
+    # The same list the leaderboard hides, used here to keep the crawl
+    # budget off domains that link out to everything.
+    SKIP_DOMAINS = set(UTILITY_DOMAINS)
 
     def frontier(self, limit: int = 20, min_referring: int = 1,
-                 skip: Optional[Iterable[str]] = None) -> List[Tuple[str, int, str]]:
+                 skip: Optional[Iterable[str]] = None
+                 ) -> List[Tuple[str, int, str, str]]:
         """Domains the index has seen linked to but has never crawled.
 
         Ranked by how many distinct domains link to them, so the most
@@ -149,13 +194,14 @@ class IndexStore:
         # guessing https:// and failing on an http-only host.
         rows = self.db.execute(
             "SELECT e.target_domain, COUNT(DISTINCT e.source_domain) AS refdoms, "
-            "MIN(e.target_url) "
+            "MIN(e.target_url), GROUP_CONCAT(e.anchor, ' | ') "
             "FROM edges e JOIN domains d ON d.domain = e.target_domain "
             "WHERE e.internal = 0 AND d.crawled = 0 AND e.target_domain != '' "
+            "AND COALESCE(d.attempts,0) < ? AND COALESCE(d.offtopic,0) = 0 "
             "GROUP BY e.target_domain HAVING refdoms >= ? "
             "ORDER BY refdoms DESC, e.target_domain LIMIT ?",
-            (min_referring, limit + len(blocked))).fetchall()
-        out = [(d, n, u) for d, n, u in rows if d not in blocked]
+            (self.MAX_ATTEMPTS, min_referring, limit + len(blocked))).fetchall()
+        out = [(d, n, u, a or "") for d, n, u, a in rows if d not in blocked]
         return out[:limit]
 
     def frontier_size(self, min_referring: int = 1) -> int:
@@ -164,8 +210,9 @@ class IndexStore:
             "SELECT COUNT(*) FROM (SELECT e.target_domain "
             "FROM edges e JOIN domains d ON d.domain = e.target_domain "
             "WHERE e.internal = 0 AND d.crawled = 0 AND e.target_domain != '' "
+            "AND COALESCE(d.attempts,0) < ? AND COALESCE(d.offtopic,0) = 0 "
             "GROUP BY e.target_domain HAVING COUNT(DISTINCT e.source_domain) >= ?)",
-            (min_referring,)).fetchone()
+            (self.MAX_ATTEMPTS, min_referring)).fetchone()
         return row[0] if row else 0
 
     def set_meta(self, key: str, value: str) -> None:
