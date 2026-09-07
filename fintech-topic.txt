@@ -1,0 +1,45 @@
+# Subject terms for a fintech / financial services index.
+# A discovered domain must show at least one of these before the crawl
+# goes deeper into it. One line each, # for comments.
+fintech
+financial technology
+payments
+payment
+banking
+bank
+neobank
+lending
+credit
+mortgage
+insurance
+insurtech
+regtech
+compliance
+aml
+kyc
+crypto
+cryptocurrency
+blockchain
+stablecoin
+defi
+digital asset
+tokenized
+exchange
+brokerage
+trading
+investing
+wealth management
+asset management
+capital markets
+remittance
+money transfer
+open banking
+embedded finance
+merchant
+acquiring
+issuing
+card
+wallet
+treasury
+financial services
+finance

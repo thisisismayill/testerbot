@@ -135,6 +135,25 @@ site and robots.txt is in your way: `--ignore-robots`. To change the pause:
 because the graph grows. Crawl several rival sites together and the real picture
 appears. Only crawl sites you are allowed to crawl.
 
+**Three things the ranking does on purpose.** `www.example.com` and `example.com`
+count as the same site, because they are: sites redirect between the two freely,
+and a crawl that treated them as different places would follow the redirect and
+then judge every internal link out of scope, stopping after a single page.
+
+And social networks, URL shorteners and CDNs are left out of the default
+ranking. They sit in the footer of nearly every website, so in a focused index
+they collect a link from everything you crawl and float to the top of a list
+they are not part of - you came to see who matters in *your* field, not to be
+told that LinkedIn is popular. They stay in the index and in the link maths; the
+dashboard has a checkbox to show them, and `--skip-domain` adds your own.
+
+Third, a domain that only one other domain links to is not ranked. One link is
+not a measurement, it is a glimpse, and scoring it anyway produces a
+confident-looking number with nothing underneath — which is the quickest way for
+an index to lose the reader's trust. Those domains keep their score and stay in
+the graph; they simply do not lead the ranking until the evidence exists. The
+dashboard has a checkbox for them too, and the run says how many are waiting.
+
 ---
 
 ## 1. Install (once)
@@ -448,6 +467,13 @@ the crawl spends its time on pages the web itself considers worth pointing at,
 not on whatever happened to be first alphabetically. `--min-links 3` raises that
 bar; a domain mentioned once by one site is usually noise.
 
+A domain it could not reach is **not** written off as crawled. Failures are
+counted instead, the domain keeps its place in the frontier, and it is retried
+on later runs until three attempts have failed. Marking an unreachable domain as
+done would quietly delete it from the index with nothing in the output to say
+so. And if three domains in a row fail to resolve, the run stops and says the
+machine looks offline, rather than burning the whole frontier on a dead network.
+
 Two things it will not do. It never expands into the big link sinks — Facebook,
 YouTube, Wikipedia, CDNs — because they link out to everything and would eat the
 whole budget; `--skip-domain` adds your own. And `--expand` refuses to run with
@@ -464,6 +490,70 @@ python3 tb_index.py --expand 200 --min-links 2 --time-budget 420 \
 
 `--time-budget` is in minutes and is checked between domains, so the run always
 finishes the domain it is on and never leaves half a site in the index.
+
+### Keeping a focused crawl focused
+
+Every website links outward to things that have nothing to do with its subject:
+its CMS vendor, its events platform, the newswire it publishes through, its job
+board, a government press release it cites. Follow those links three rings out
+and a crawl that started in fintech is reading astrophysics listings and meetup
+pages — and the "index of your field" is no longer an index of your field. This
+is the failure mode that matters most for a focused index, because it destroys
+the one advantage a small index has over a web-scale one.
+
+Give the crawl a subject and it stops:
+
+```bash
+python3 tb_index.py --expand 40 \
+    --topic fintech --topic payments --topic banking --topic crypto
+# or, for a longer list:
+python3 tb_index.py --expand 40 --topic-file fintech-topic.txt
+```
+
+Three gates, cheapest first:
+
+1. **Infrastructure** — job boards, newswires, event platforms, CMS vendors,
+   code hosts, general news. A link to any of them says nothing about the
+   linking site's subject. Costs nothing; they never enter the crawl.
+2. **Anchor text** — the words in the links pointing at a candidate. Also free,
+   because those are already in the index. One term is enough here: an anchor
+   is three words, and demanding more would throw away real sites linked as
+   "payments partner".
+3. **The page itself** — one page is fetched and read, and it must show **two
+   different** subject terms (`--min-topic-hits`). One is too easy: a gaming
+   site that mentions "blockchain" once in a news story passes on one term, and
+   the crawl then spends twenty-five pages on Elden Ring and GTA 6. Two is a
+   much better line, because a site really in the field uses several of its
+   words while a site outside it rarely uses two. A page that shows fewer is
+   abandoned there — one page instead of twenty-five — and marked so it never
+   returns to the frontier.
+
+A page that carries almost no text is not judged at all. A consent wall or a
+JS-only shell has not told us it is off the subject; it has told us nothing, and
+treating silence as a verdict is how this index lost CoinDesk on its first clean
+run. Such domains are kept, and the run says why.
+
+A domain ruled off-subject is not a failure and is owed no retry — we looked,
+and the answer will not change. It stays in the graph as a link target; the
+crawl simply does not go deeper into it.
+
+Without `--topic` nothing is filtered, so existing behaviour is unchanged.
+
+`--per-domain-seconds` (default 180) caps how long any one domain may hold the
+crawl. An index is built on breadth: twenty-five pages from a hundred domains
+says far more about who links to whom than twenty-five pages from twenty. On a
+real run a single slow government site spent half the budget on its own. When
+the cap is reached the run says so and keeps every page it did harvest.
+
+If the dashboard cannot be written — a read-only folder, a full disk, a
+permission macOS will not grant — the run says so and carries on. The crawl is
+the expensive part and it is already committed to the index database, so it is
+never thrown away because one HTML file would not save. Rebuild the dashboard
+afterwards without crawling anything again:
+
+```bash
+python3 tb_index.py --no-crawl --db your-index.db --out some-other-folder
+```
 
 On macOS, `crontab -e` and add one line to run it at 02:00 every night:
 
