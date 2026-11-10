@@ -322,6 +322,9 @@ python3 tester_bot.py https://your-site.com \
 - An API call such as `/api/profile` or `/api/token/refresh` answering 401/403/400
   while the bot is **not** logged in: that is the normal answer for a visitor. It
   is listed once as *info*. Logged in, the same answer is a real problem.
+- An API call answering 400/404 with "nothing here" (`{"message": "No referred users"}`)
+  is listed as *low* - the account simply has no data yet - unless the page shows
+  an error message too.
 - A copy-to-clipboard button: the test browser is allowed to use the clipboard,
   and a click that copies counts as doing something.
 - Tabs that only move a "selected" style or redraw a chart: any change to the page
