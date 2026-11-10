@@ -51,6 +51,7 @@ function header() {
   const h = $('header');
   if (token()) {
     h.append(navItem('Dashboard', () => go('/dashboard')), navItem('Reports', () => go('/reports')),
+             navItem('Statistics', () => go('/statistics')),
              navItem('Settings', () => go('/settings')), $('div', {className: 'grow'}),
              navItem('Log out', () => { localStorage.removeItem('tok'); go('/'); }));
   } else {
@@ -132,13 +133,33 @@ function dashboard() {
   pw.append($('label', {htmlFor: 'np', textContent: 'New password'}), $('input', {id: 'np', type: 'password', autocomplete: 'new-password'}),
             $('button', {type: 'submit', textContent: 'Change password'}));
   pw.onsubmit = (e) => { e.preventDefault(); localStorage.removeItem('tok'); };
+  api('/api/revenue').catch(() => {});                       // answers 400 with a reason
   m.append($('h1', {textContent: 'Partner dashboard'}), $('p', {textContent: 'Welcome back, partner.'}), stats,
+           $('button', {textContent: 'Copy referral link',
+                        onclick: () => navigator.clipboard.writeText('https://example.test/r/qa')}),
+           $('button', {textContent: 'Payment History', onclick: () => go('/payments')}),
            $('button', {textContent: 'Withdraw earnings'}), pw);
   return m;
 }
 function reports() {
   const m = $('main');
   m.append($('h1', {textContent: 'Reports'}), $('div', {className: 'wide', textContent: 'A 900px wide table of clicks per day.'}));
+  return m;
+}
+function statistics() {
+  const m = $('main'), chart = $('canvas', {width: 300, height: 80});
+  const draw = (n) => { const g = chart.getContext('2d'); g.clearRect(0, 0, 300, 80);
+    g.fillStyle = '#4c7dff'; for (let i = 0; i < 10; i++) g.fillRect(i * 30, 80 - (i * n * 7) % 80, 20, 80); };
+  const tabs = ['Clicks', 'Sign ups', 'Deposits'].map((t, i) => $('button', {type: 'button', className: i ? 'tab' : 'tab sel', textContent: t}));
+  tabs.forEach((b, i) => b.addEventListener('click', () => {
+    tabs.forEach(x => x.className = 'tab'); b.className = 'tab sel'; draw(i + 2); }));
+  draw(1);
+  m.append($('h1', {textContent: 'Statistics'}), ...tabs, chart);
+  return m;
+}
+function payments() {
+  const m = $('main');
+  m.append($('h1', {textContent: 'Payment history'}), $('p', {textContent: 'No payouts yet.'}));
   return m;
 }
 function settings() {
@@ -149,8 +170,9 @@ function settings() {
 async function render() {
   const root = document.getElementById('root'), p = location.pathname;
   const pages = {'/': home, '/login': login, '/registration': registration, '/password-recovery': recovery,
-                 '/dashboard': dashboard, '/reports': reports, '/settings': settings};
-  const inside = ['/dashboard', '/reports', '/settings'];
+                 '/dashboard': dashboard, '/reports': reports, '/settings': settings,
+                 '/statistics': statistics, '/payments': payments};
+  const inside = ['/dashboard', '/reports', '/settings', '/statistics', '/payments'];
   if (inside.includes(p) && !token()) { history.replaceState(null, '', '/login'); return render(); }
   root.replaceChildren(header(), (pages[p] || (() => $('main')))(), footer());
 }
@@ -187,6 +209,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/profile/":
             return self._send('{"email":"%s"}' % USER if self._authed() else '{"detail":"no"}',
                               200 if self._authed() else 401, "application/json")
+        if path == "/api/revenue":
+            if not self._authed():
+                return self._send('{"detail":"no"}', 401, "application/json")
+            return self._send('{"detail":"date_from is required"}', 400, "application/json")
         if path == "/api/stats":
             if not self._authed():
                 return self._send('{"detail":"no"}', 401, "application/json")
