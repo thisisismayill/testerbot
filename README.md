@@ -217,12 +217,24 @@ python3 tester_bot.py https://your-site.com \
   --extra-url https://your-site.com/profile
 ```
 
+- With a login the site is walked **twice**: first as a visitor (the public
+  pages, sign-up, password reset), then signed in (the area behind the login).
+  The page budget is shared between the two walks. The report marks each page
+  with `signed_in`, and the header says whether the login worked.
 - The bot tries to find the login form itself. If it cannot, point it there with
-  `--user-selector`, `--pass-selector`, `--submit-selector`.
+  `--user-selector`, `--pass-selector`, `--submit-selector`. Single-page apps
+  that check the password over an API and redraw are waited for.
 - `--login-success-url` or `--login-success-text` confirms the sign-in really
-  worked. If it did not, the bot records that as a **Critical** problem.
+  worked. If it did not, the bot records that as a **Critical** problem, with a
+  screenshot and the message the site showed.
+- The page the site lands on after the login (often the dashboard) is tested
+  first, and pages reached by clicking menu buttons are tested too - many apps
+  have no ordinary links behind the login.
 - The bot does not follow `/logout` or `/signout` links, so the session is not
   lost. If it is lost anyway, the bot signs in again automatically.
+- The password is never printed, never put in a finding and never written to
+  the report. Forms with a password field are not sent made-up data while a
+  login is in use (that could change the account's password or lock it out).
 - To keep the session and reuse it later: `--save-storage-state session.json`,
   then `--storage-state session.json` next time.
 
@@ -263,10 +275,26 @@ python3 tester_bot.py https://your-site.com \
 - Does the login form accept made-up credentials (critical), and does it show an
   error message for a wrong password
 
+**Content a human tester would notice** (since v2.6)
+- Spelling: well-known misspellings (*COMMISION*, *recieve*, *adress* …), one word
+  spelled two ways on the same page, and wrong set phrases such as
+  *Forget Password?* - English pages only, so other languages are not flagged
+- A contact link that shows one address but opens another
+  (`info@…` on screen, `mailto:partnership@…` behind it), the same for phone numbers
+- A field labelled *optional* that the form nevertheless requires
+- A `<label for=…>` that points at an id no field has
+- Clickable `<div>`s (menus built without links or buttons) that a keyboard
+  cannot reach
+- Personal-data fields without `autocomplete` hints
+- Content that only appears after JavaScript runs (empty server HTML)
+
 **Mobile / responsive**
 - Horizontal scroll at 390px (phone) and 820px (tablet)
 - A missing viewport meta tag
 - It also tells you which element overflows, with a screenshot
+- An overflow is only reported after the page is opened fresh at that width,
+  the way a phone opens it - a layout that is too wide for a moment while a
+  desktop window shrinks is not a phone problem
 
 **Accessibility**
 - Deque's **axe-core** engine (WCAG 2.1 A/AA) — bundled in, no internet needed
@@ -285,6 +313,13 @@ python3 tester_bot.py https://your-site.com \
 **SEO / metadata**
 - `<title>`, meta description, `h1`, canonical, Open Graph, favicon, robots.txt,
   sitemap.xml, a `noindex` left behind by accident
+- A robots.txt or sitemap.xml that is really the site's HTML page (single-page
+  apps answer every address with 200) counts as missing
+
+**Not reported as a fault**
+- An API call such as `/api/profile` or `/api/token/refresh` answering 401/403/400
+  while the bot is **not** logged in: that is the normal answer for a visitor. It
+  is listed once as *info*. Logged in, the same answer is a real problem.
 
 ---
 
@@ -422,6 +457,18 @@ python3 tester_bot.py http://localhost:8099 \
 In the report you will see the broken links, the JS errors, the dead control, the
 unescaped output, the form with no server-side validation, the mobile overflow
 and the rest.
+
+A second test site behaves like a React app with a login (every address answers
+200, the menu is made of `<div>`s, the dashboard is only reachable by clicking):
+
+```bash
+# terminal 1 - the test account is qa@example.test, the password is yours to pick
+TB_TEST_PASSWORD='pick-one' python3 testsite/spa_server.py
+
+# terminal 2
+TESTERBOT_USER=qa@example.test TESTERBOT_PASS='pick-one' \
+  python3 tester_bot.py http://localhost:8098 --login-url http://localhost:8098/login
+```
 
 ---
 
@@ -650,6 +697,7 @@ webtester-bot/
 ├── install.sh / install.bat
 ├── config.example.yaml
 ├── testsite/server.py      # the deliberately broken sample site
+├── testsite/spa_server.py  # a single-page app with a login, for the login checks
 └── testerbot/
     ├── crawler.py          # crawling + orchestration
     ├── auth.py             # login
