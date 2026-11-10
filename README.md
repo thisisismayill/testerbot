@@ -246,7 +246,9 @@ python3 tester_bot.py https://your-site.com \
 
 **At page level**
 - Uncaught JavaScript errors and `console.error` messages
-- HTTP 4xx / 5xx responses (both the page itself and background API calls)
+- HTTP 4xx / 5xx responses (both the page itself and background API calls) - for a
+  failing API call the report also shows the start of the server's answer
+  (e.g. `{"detail": "date_from is required"}`), which usually names the cause
 - Images that fail to load, failed network requests
 - Empty or nearly empty pages
 - "Junk" text visible to users: `undefined`, `NaN`, `[object Object]`,
@@ -320,6 +322,12 @@ python3 tester_bot.py https://your-site.com \
 - An API call such as `/api/profile` or `/api/token/refresh` answering 401/403/400
   while the bot is **not** logged in: that is the normal answer for a visitor. It
   is listed once as *info*. Logged in, the same answer is a real problem.
+- A copy-to-clipboard button: the test browser is allowed to use the clipboard,
+  and a click that copies counts as doing something.
+- Tabs that only move a "selected" style or redraw a chart: any change to the page
+  counts, not only a change in its size.
+- Money words used for reading - *Payment history*, *How do I get the payment?* -
+  are clicked like any other link; *Pay now*, *Withdraw*, *Delete* … never are.
 
 ---
 
