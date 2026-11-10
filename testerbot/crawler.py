@@ -364,7 +364,8 @@ class TesterBot:
         # ---- console / network
         self.add(audits.audit_console(url, rec.console, rec.page_errors))
         self.add(audits.audit_network(url, rec.failed, rec.bad_responses(),
-                                      logged_in=self.logged_in, body_of=rec.body_of))
+                                      logged_in=self.logged_in, body_of=rec.body_of,
+                                      page_text=data.get("text")))
 
         # ---- performance
         try:

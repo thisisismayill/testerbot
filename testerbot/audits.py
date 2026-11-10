@@ -87,10 +87,15 @@ def audit_console(url: str, console_msgs: List[Dict[str, Any]],
 
 # ---------------------------------------------------------------- network
 
+_ERRORISH = re.compile(r"\b(error|failed|failure|something went wrong|try again|could not|"
+                       r"couldn't|unable to)\b", re.I)
+
+
 def audit_network(url: str, failed: List[Dict[str, Any]],
                   bad_responses: List[Dict[str, Any]], logged_in: bool = False,
-                  body_of=None) -> List[Finding]:
+                  body_of=None, page_text: Optional[str] = None) -> List[Finding]:
     out: List[Finding] = []
+    shows_error = bool(page_text) and bool(_ERRORISH.search(page_text or ""))
     if not logged_in:
         probes = [r for r in bad_responses if is_auth_probe(r)]
         bad_responses = [r for r in bad_responses if not is_auth_probe(r)]
@@ -121,25 +126,80 @@ def audit_network(url: str, failed: List[Dict[str, Any]],
         ))
     for resp in bad_responses:
         status = resp["status"]
-        sev = "critical" if status >= 500 else "high"
         answer = body_of(resp) if body_of else ""
         ev = {"request_url": resp["url"], "status": status,
               "method": resp.get("method"), "resource_type": resp.get("resource_type")}
         if answer:
             ev["response"] = answer
+        background = resp.get("resource_type") in ("xhr", "fetch")
+        if background and is_empty_answer(status, answer):
+            msg = answer_message(answer)
+            out.append(Finding(
+                severity="medium" if shows_error else "low", category="Network",
+                title=f"API answers {status} for an empty result"
+                      f"{'' if shows_error else ' (the page shows no error)'}: "
+                      f"{shorten(resp['url'], 60)}",
+                detail=f"While this page loads, a background call gets HTTP {status} with the "
+                       f"message '{msg[:120]}'. That reads as 'there is nothing to show yet' for "
+                       "this account rather than a fault. "
+                       + ("The page does show an error message, though - check that it is not "
+                          "this call's doing." if shows_error else
+                          "The page shows no error, so visitors are not affected; it is only "
+                          "visible in the browser's developer tools (Network)."),
+                url=url, evidence=ev,
+                how_to_fix="Optional: answer 200 with an empty result instead of an error code, so "
+                           "browsers and monitoring do not count it as a failure."))
+            continue
+        sev = "critical" if status >= 500 else ("medium" if status == 429 else "high")
         out.append(Finding(
             severity=sev, category="Network",
             title=f"HTTP {status} on {resp.get('resource_type', 'request')}: "
                   f"{shorten(resp['url'], 70)}",
-            detail=f"A sub-request returned HTTP {status} while loading this page."
-                   + (" A 5xx means the server itself errored."
-                      if status >= 500 else " The resource is missing or forbidden.")
+            detail=f"A sub-request returned HTTP {status} while loading this page. "
+                   + STATUS_WORDS.get(status, "A 5xx means the server itself errored."
+                                      if status >= 500 else "The request did not succeed.")
+                   + (" It happens in the background: the page may show no error, only missing "
+                      "or wrong data in the part that depends on it - check that part."
+                      if background else "")
                    + (f" The server answered: {answer[:200]}" if answer else ""),
             url=url,
             evidence=ev,
             how_to_fix="Fix the endpoint or stop the page from requesting it.",
         ))
     return out
+
+
+STATUS_WORDS = {
+    400: "The server rejected the request as invalid.",
+    401: "The server refused it: not signed in.",
+    403: "The server refused it: not allowed.",
+    404: "The resource does not exist.",
+    405: "The server does not accept this kind of request here.",
+    409: "The server reported a conflict.",
+    410: "The resource has been removed.",
+    422: "The server rejected the data it was sent.",
+    429: "The server is limiting the page's requests (possibly because the test is fast).",
+}
+
+# An API that says "there is nothing" with an error code: {"message": "No referred users"}.
+_EMPTY_MSG = re.compile(r"^\s*(no|zero)\s+[a-z]|\b(empty|nothing found|no (data|results?|records?|"
+                        r"entries|items?))\b", re.I)
+_NOT_EMPTY = re.compile(r"permission|authori[sz]|forbidden|token|credential|log ?in|denied|invalid|"
+                        r"required|missing|must|expired|not allowed|access|exceed|limit", re.I)
+_MSG_FIELD = re.compile(r'"(?:message|detail|error|msg|description)"\s*:\s*"([^"]{1,300})"', re.I)
+
+
+def answer_message(answer: str) -> str:
+    """The human message inside an API answer (a JSON 'message'/'detail'/… field), else the answer."""
+    m = _MSG_FIELD.search(answer or "")
+    return m.group(1) if m else (answer or "")
+
+
+def is_empty_answer(status: int, answer: str) -> bool:
+    if status not in (400, 404, 409, 422) or not answer:
+        return False
+    msg = answer_message(answer)
+    return bool(_EMPTY_MSG.search(msg)) and not _NOT_EMPTY.search(msg)
 
 
 # ---------------------------------------------------------------- HTTP + headers
