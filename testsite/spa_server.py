@@ -134,6 +134,7 @@ function dashboard() {
             $('button', {type: 'submit', textContent: 'Change password'}));
   pw.onsubmit = (e) => { e.preventDefault(); localStorage.removeItem('tok'); };
   api('/api/revenue').catch(() => {});                       // answers 400 with a reason
+  api('/api/overview').catch(() => {});                      // answers 400 "No referred users"
   m.append($('h1', {textContent: 'Partner dashboard'}), $('p', {textContent: 'Welcome back, partner.'}), stats,
            $('button', {textContent: 'Copy referral link',
                         onclick: () => navigator.clipboard.writeText('https://example.test/r/qa')}),
@@ -209,6 +210,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/profile/":
             return self._send('{"email":"%s"}' % USER if self._authed() else '{"detail":"no"}',
                               200 if self._authed() else 401, "application/json")
+        if path == "/api/overview":
+            if not self._authed():
+                return self._send('{"detail":"no"}', 401, "application/json")
+            return self._send('{"message":"No referred users"}', 400, "application/json")
         if path == "/api/revenue":
             if not self._authed():
                 return self._send('{"detail":"no"}', 401, "application/json")
