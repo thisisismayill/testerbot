@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from .audits import is_auth_probe
 from .config import Config
 from .models import Finding
 from .recorder import Recorder
@@ -22,21 +23,47 @@ FINGERPRINT_JS = """
 
 WIDE_ELEMENTS_JS = """
 (vw) => {
-  const out = [];
-  const walk = document.querySelectorAll('body *');
-  for (const el of walk) {
-    const r = el.getBoundingClientRect();
-    if (r.width > vw + 4 && r.height > 0) {
-      let sel = el.tagName.toLowerCase();
-      if (el.id) sel += '#' + el.id;
-      const c = (el.getAttribute('class') || '').trim().split(/\\s+/)[0];
-      if (c) sel += '.' + c;
-      out.push({ selector: sel, width: Math.round(r.width),
-                 right: Math.round(r.right), text: (el.innerText || '').trim().slice(0, 60) });
-      if (out.length > 12) break;
+  // Elements that stick out past the right edge of the screen - wider than it, or
+  // pushed over it - and are not inside something that clips or scrolls them.
+  // Only the outermost one of each nest is listed: that is the one to fix.
+  const out = [], listed = [];
+  const clipped = (el) => {
+    for (let p = el.parentElement; p && p !== document.body && p !== document.documentElement;
+         p = p.parentElement) {
+      const ox = getComputedStyle(p).overflowX;
+      if (ox === 'hidden' || ox === 'auto' || ox === 'scroll' || ox === 'clip') return true;
     }
+    return false;
+  };
+  const sx = window.scrollX || 0;
+  for (const el of document.querySelectorAll('body *')) {
+    const r = el.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1 || r.right + sx <= vw + 4) continue;
+    if (listed.some(p => p.contains(el))) continue;
+    const st = getComputedStyle(el);
+    if (st.position === 'fixed' || st.display === 'none') continue;
+    if (clipped(el)) continue;
+    let sel = el.tagName.toLowerCase();
+    if (el.id) sel += '#' + el.id;
+    const c = (el.getAttribute('class') || '').trim().split(/\\s+/)[0];
+    if (c) sel += '.' + c;
+    listed.push(el);
+    out.push({ selector: sel, width: Math.round(r.width), right: Math.round(r.right + sx),
+               text: (el.innerText || '').trim().slice(0, 60) });
+    if (out.length > 12) break;
   }
   return out;
+}
+"""
+
+# How wide the page really is, and whether the page clips its own overflow (then
+# nobody can scroll sideways, whatever scrollWidth says).
+OVERFLOW_JS = """
+() => {
+  const de = document.documentElement, b = document.body;
+  const clip = (el) => el && ['hidden', 'clip'].includes(getComputedStyle(el).overflowX);
+  return { scrollWidth: Math.max(de.scrollWidth, b ? b.scrollWidth : 0),
+           clientWidth: de.clientWidth, clipped: clip(de) || clip(b) };
 }
 """
 
@@ -55,8 +82,12 @@ ESCAPE_PAYLOAD = f"<b>{ESCAPE_MARKER}</b>"
 
 def click_everything(page, cfg: Config, rec: Recorder, url: str,
                      clickables: List[Dict[str, Any]], tested: Set[str],
-                     shot) -> Tuple[List[Finding], int]:
-    """Click every safe interactive element on the page."""
+                     shot, logged_in: bool = False,
+                     discovered: Optional[List[str]] = None) -> Tuple[List[Finding], int]:
+    """Click every safe interactive element on the page.
+
+    Pages a click leads to are added to `discovered`, so menus built from buttons
+    or divs (common in single-page apps) still get their pages tested."""
     findings: List[Finding] = []
     danger = cfg.danger_re()
     clicked = 0
@@ -163,6 +194,8 @@ def click_everything(page, cfg: Config, rec: Recorder, url: str,
                               "method": resp.get("method")},
                     how_to_fix="Check the server logs for this endpoint."))
             elif resp["status"] in (401, 403, 404) and resp["resource_type"] in ("xhr", "fetch"):
+                if not logged_in and is_auth_probe(resp):
+                    continue      # "not signed in" is the right answer for a visitor
                 findings.append(Finding(
                     severity="high", category="Network",
                     title=f"Clicking '{text[:40] or item['tag']}' calls a "
@@ -194,6 +227,8 @@ def click_everything(page, cfg: Config, rec: Recorder, url: str,
                 how_to_fix="Confirm the control has a working handler."))
 
         if navigated:
+            if discovered is not None and after.get("url"):
+                discovered.append(after["url"])
             try:
                 page.go_back(timeout=cfg.nav_timeout_ms, wait_until="domcontentloaded")
             except Exception:
@@ -222,7 +257,7 @@ def _fingerprint(page) -> Dict[str, Any]:
 # ====================================================================== forms
 
 def test_forms(page, cfg: Config, rec: Recorder, url: str, forms: List[Dict[str, Any]],
-               tested: Set[str], shot) -> Tuple[List[Finding], int]:
+               tested: Set[str], shot, logged_in: bool = False) -> Tuple[List[Finding], int]:
     findings: List[Finding] = []
     danger = cfg.danger_re()
     count = 0
@@ -280,6 +315,15 @@ def test_forms(page, cfg: Config, rec: Recorder, url: str, forms: List[Dict[str,
                 how_to_fix="Mark the mandatory inputs with the required attribute."))
 
         if not cfg.submit_forms:
+            continue
+        if logged_in and form.get("hasPassword") and not cfg.danger_mode:
+            findings.append(Finding(
+                severity="info", category="Skipped",
+                title="Form with a password field not submitted (a test login is in use)",
+                detail="Sending made-up data to it could change the test account's password, "
+                       "end the session or lock the account out, so TesterBot left it alone. "
+                       "Use --danger-mode on a staging copy to include it.",
+                url=url, element=form.get("selector")))
             continue
         if form.get("hasPassword") and "signup" not in blob.lower():
             # avoid brute-forcing login forms we did not get credentials for

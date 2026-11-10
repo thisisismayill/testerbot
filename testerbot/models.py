@@ -52,6 +52,7 @@ class PageResult:
     status: Optional[int] = None
     title: str = ""
     depth: int = 0
+    signed_in: bool = False        # visited with the test login active
     load_ms: Optional[float] = None
     ttfb_ms: Optional[float] = None
     dom_ready_ms: Optional[float] = None

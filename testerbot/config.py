@@ -48,6 +48,7 @@ class Config:
     login_success_url: str = ""
     storage_state: str = ""        # load an existing session
     save_storage_state: str = ""   # write session here after login
+    login_problem: str = ""        # a login was asked for but could not be set up (why)
 
     # --- intelligence (site authority / performance / tech stack) -----
     run_intelligence: bool = True
@@ -144,6 +145,7 @@ class Config:
         """Credentials may come from the environment so they never land in a file."""
         self.username = os.environ.get("TESTERBOT_USER", self.username)
         self.password = os.environ.get("TESTERBOT_PASS", self.password)
+        self.login_problem = os.environ.get("TESTERBOT_LOGIN_PROBLEM", self.login_problem)
         self.opr_key = os.environ.get("TESTERBOT_OPR_KEY", self.opr_key)
         self.psi_key = os.environ.get("TESTERBOT_PSI_KEY", self.psi_key)
 

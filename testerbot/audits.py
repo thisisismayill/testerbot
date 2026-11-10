@@ -1,12 +1,34 @@
 """Turn raw page observations into Findings."""
 from __future__ import annotations
 
+import html as _html
 import re
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
+from . import textcheck
 from .config import Config
 from .models import Finding
 from .urls import shorten
+
+# Calls a page makes to ask "is this visitor signed in?". For a visitor who is
+# not, a 400/401/403 from these is the normal answer, not a fault.
+AUTH_PROBE_RE = re.compile(
+    r"(auth|token|refresh|session|login|logout|sign-?in|profile|account|whoami|"
+    r"(^|/)me(/|$)|(^|/)users?/(me|current|self)|current-?user|csrf|oauth|jwt|identity|"
+    r"permission)", re.I)
+
+
+def is_auth_probe(resp: Dict[str, Any]) -> bool:
+    if resp.get("resource_type") not in ("xhr", "fetch"):
+        return False
+    if resp.get("status") not in (400, 401, 403):
+        return False
+    try:
+        p = urlparse(resp.get("url") or "")
+    except ValueError:
+        return False
+    return bool(AUTH_PROBE_RE.search(p.path + ("?" + p.query if p.query else "")))
 
 # ---------------------------------------------------------------- console / JS
 
@@ -63,8 +85,25 @@ def audit_console(url: str, console_msgs: List[Dict[str, Any]],
 # ---------------------------------------------------------------- network
 
 def audit_network(url: str, failed: List[Dict[str, Any]],
-                  bad_responses: List[Dict[str, Any]]) -> List[Finding]:
+                  bad_responses: List[Dict[str, Any]], logged_in: bool = False) -> List[Finding]:
     out: List[Finding] = []
+    if not logged_in:
+        probes = [r for r in bad_responses if is_auth_probe(r)]
+        bad_responses = [r for r in bad_responses if not is_auth_probe(r)]
+        if probes:
+            codes = sorted({str(r["status"]) for r in probes})
+            out.append(Finding(
+                severity="info", category="Network",
+                title="Sign-in checks answer 'not signed in' (normal for visitors)",
+                detail=f"The page asks the server whether the visitor is signed in, and the server "
+                       f"answers {'/'.join(codes)}. TesterBot was not logged in, so that is the "
+                       "expected answer, not a fault. Test with a login to check these calls for a "
+                       "signed-in user.",
+                url=url,
+                evidence={"requests": [{"url": r["url"], "status": r["status"],
+                                        "method": r.get("method")} for r in probes[:8]]},
+                how_to_fix="Nothing to fix if the page works. Some teams skip these calls for "
+                           "visitors to keep the browser console clean."))
     for req in failed:
         out.append(Finding(
             severity="high", category="Network",
@@ -294,8 +333,25 @@ def audit_dom(url: str, d: Dict[str, Any], cfg: Config, is_entry: bool) -> List[
                     how_to_fix="Use a <button> for actions, or give the anchor a real href."))
 
     # ---- forms & labels
-    unl = [u for u in d.get("unlabelled", []) if not u.get("placeholderOnly")]
-    ph_only = [u for u in d.get("unlabelled", []) if u.get("placeholderOnly")]
+    orphaned = d.get("labelsOrphaned") or []
+    near = {o.get("field") for o in orphaned if o.get("field")}
+    if orphaned:
+        ex = orphaned[0]
+        fix = (f'Change for="{ex["points_to"]}" to for="{ex["field_id"]}" (the field\'s real id).'
+               if ex.get("field_id") else
+               "Make each label's for= match the id of its field.")
+        add(Finding(severity="medium", category="Accessibility",
+                    title="Label is not connected to its field", url=url,
+                    occurrences=len(orphaned),
+                    detail=f"The label '{ex.get('label', '')}' points to id '{ex['points_to']}', but "
+                           "no element has that id. Screen readers do not read the label for the "
+                           "field, and clicking the label does not put the cursor in the field.",
+                    element=ex.get("field") or None, evidence={"labels": orphaned[:10]},
+                    how_to_fix=fix))
+    unl = [u for u in d.get("unlabelled", [])
+           if not u.get("placeholderOnly") and u.get("selector") not in near]
+    ph_only = [u for u in d.get("unlabelled", [])
+               if u.get("placeholderOnly") and u.get("selector") not in near]
     if unl:
         add(Finding(severity="medium", category="Accessibility",
                     title="Form fields with no label", url=url, occurrences=len(unl),
@@ -318,6 +374,49 @@ def audit_dom(url: str, d: Dict[str, Any], cfg: Config, is_entry: bool) -> List[
                     evidence={"buttons": d["namelessButtons"][:10]},
                     detail="Icon-only buttons are announced as just 'button'.",
                     how_to_fix="Add aria-label or visually hidden text."))
+    for item in (d.get("optionalRequired") or [])[:5]:
+        add(Finding(severity="medium", category="Forms",
+                    title=f"Field says optional but the form requires it: '{item['label'][:50]}'",
+                    url=url, element=item.get("selector"),
+                    detail=f"'{item['label']}' is marked required, so the form will not send until "
+                           "it is filled in. Visitors who trust the word 'optional' get stuck.",
+                    evidence=item,
+                    how_to_fix="Remove the required rule, or remove 'optional' from the label."))
+    traps = d.get("clickTraps") or []
+    if traps:
+        names = ", ".join(f"'{t['text']}'" for t in traps[:5] if t.get("text")) or "icons"
+        add(Finding(severity="medium", category="Accessibility",
+                    title="Clickable items a keyboard cannot reach", url=url,
+                    occurrences=len(traps), element=traps[0].get("selector"),
+                    detail=f"{len(traps)} item(s) react to a mouse click but are not links or "
+                           f"buttons, so keyboard and screen-reader users cannot use them: {names}.",
+                    evidence={"items": traps[:15]},
+                    how_to_fix="Use <a href> for navigation and <button> for actions. If a <div> "
+                               "must stay, give it role=\"button\" and tabindex=\"0\" and make "
+                               "Enter and Space work."))
+    for m in (d.get("contactMismatch") or [])[:5]:
+        what = "e-mail address" if m.get("kind") == "email" else "phone number"
+        add(Finding(severity="medium", category="Content",
+                    title=f"Contact link opens a different {what} than it shows",
+                    url=url, element=m.get("selector"),
+                    detail=f"The page shows {m['shown']} but the link opens {m['opens']}. Visitors "
+                           "who click write to an address they did not choose; visitors who copy "
+                           "the shown one write somewhere else.",
+                    evidence=m,
+                    how_to_fix="Make the shown text and the link target the same."))
+    noac = d.get("noAutocomplete") or []
+    if noac:
+        add(Finding(severity="low", category="Forms",
+                    title="Personal-data fields give no autocomplete hint", url=url,
+                    occurrences=len(noac), element=noac[0].get("selector"),
+                    detail="Browsers and password managers cannot reliably fill these fields "
+                           "(WCAG 1.3.5): " + ", ".join(f"{f['type']} '{f['name']}'" if f.get('name')
+                                                 else f"{f['type']} field" for f in noac[:6]) + ".",
+                    evidence={"fields": noac[:15]},
+                    how_to_fix='Add autocomplete="email", "username", "current-password" or '
+                               '"new-password", "tel", "given-name", "family-name" … to the fields.'))
+    if d.get("text"):
+        out.extend(textcheck.check(url, d.get("text", ""), d.get("uiText") or [], d.get("lang", "")))
     if d.get("insecureForms", 0):
         add(Finding(severity="critical", category="Security",
                     title="Form submits over plain HTTP", url=url,
@@ -410,18 +509,57 @@ def audit_performance(url: str, cfg: Config, timing: Dict[str, Any],
 
 def audit_responsive(url: str, label: str, width: int, metrics: Dict[str, Any],
                      screenshot: Optional[str]) -> List[Finding]:
+    """metrics come from a page opened fresh at this width (see TesterBot.check_responsive),
+    so a layout that only overflows for a moment while a desktop window shrinks is not
+    reported - a phone never goes through that."""
     out: List[Finding] = []
     scroll_w = metrics.get("scrollWidth", 0)
     if scroll_w and scroll_w > width + 4:
+        wide = metrics.get("wide", [])[:5]
+        culprit = (f" The widest element is {wide[0]['selector']} ({wide[0]['right']}px to its "
+                   "right edge)." if wide else
+                   " TesterBot could not single out the element; look for anything with a fixed "
+                   "width, a wide image or table, or something positioned off-screen.")
         out.append(Finding(
             severity="medium", category="Responsive",
             title=f"Horizontal scrolling on {label} ({width}px)",
             detail=f"Content is {scroll_w}px wide in a {width}px viewport, so the user has to "
-                   "scroll sideways. Usually one element with a fixed width or an unwrapped table.",
+                   "scroll sideways." + culprit,
             url=url,
             evidence={"viewport_width": width, "content_width": scroll_w,
                       "overflow_px": scroll_w - width,
-                      "widest_elements": metrics.get("wide", [])[:5]},
+                      "checked_after_fresh_load": bool(metrics.get("reloaded")),
+                      "widest_elements": wide},
             screenshot=screenshot,
             how_to_fix="Find the overflowing element and give it max-width:100% / overflow-x:auto."))
     return out
+
+
+# ---------------------------------------------------------------- server HTML
+
+_SCRIPTISH = re.compile(r"<(script|style|noscript|template|svg)\b.*?</\1\s*>", re.I | re.S)
+
+
+def visible_text_len(html_text: str) -> int:
+    """Characters of readable text in raw HTML, before any JavaScript runs."""
+    body = _SCRIPTISH.sub(" ", html_text or "")
+    body = re.sub(r"<!--.*?-->", " ", body, flags=re.S)
+    body = re.sub(r"<head\b.*?</head\s*>", " ", body, flags=re.I | re.S)
+    body = re.sub(r"<[^>]+>", " ", body)
+    return len(" ".join(_html.unescape(body).split()))
+
+
+def audit_rendering(url: str, server_chars: Optional[int], rendered_chars: int) -> List[Finding]:
+    if server_chars is None or rendered_chars < 600 or server_chars >= 150:
+        return []
+    return [Finding(
+        severity="low", category="SEO",
+        title="Page content only appears after JavaScript runs",
+        detail=f"The HTML the server sends holds about {server_chars} characters of text; the "
+               f"finished page shows about {rendered_chars}. Search engines that do not run "
+               "JavaScript, link previews in chat apps and some assistive tools see an almost "
+               "empty page.",
+        url=url, evidence={"server_html_text_chars": server_chars,
+                           "rendered_text_chars": rendered_chars},
+        how_to_fix="Render the main content on the server (SSR) or pre-render the public pages, "
+                   "at least the ones that should appear in search.")]

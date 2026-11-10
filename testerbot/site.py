@@ -57,6 +57,19 @@ def _verdict(resp) -> Tuple[str, Optional[int]]:
     return "blocked", resp.status
 
 
+def _is_html(resp, body: str = "") -> bool:
+    """A 200 that is really the site's normal page (single-page apps answer every
+    address with their index.html), not the file that was asked for."""
+    try:
+        ctype = (resp.headers.get("content-type") or "").lower()
+    except Exception:
+        ctype = ""
+    if "text/html" in ctype:
+        return True
+    low = (body or "")[:600].lower().lstrip()
+    return low.startswith("<!doctype html") or low.startswith("<html") or "<body" in low
+
+
 def check_reachable(request, base_url: str) -> Tuple[bool, List[Finding]]:
     """Does the site answer us at all? Returns (blocked, findings).
 
@@ -93,7 +106,23 @@ def discover_sitemap_urls(request, base_url: str, cfg: Config,
     robots = fetch(request, root + "/robots.txt")
     robots_state, robots_status = _verdict(robots)
     sitemap_refs: List[str] = []
-    if robots_state == "missing":
+    if robots_state == "present":
+        try:
+            if _is_html(robots, robots.text()):
+                robots_state = "html"
+        except Exception:
+            pass
+    if robots_state == "html":
+        findings.append(Finding(
+            severity="low", category="Site Hygiene",
+            title="No robots.txt", url=root + "/robots.txt",
+            detail="The address answers 200 with the site's normal HTML page instead of a "
+                   "robots.txt file, so crawlers get no guidance (and some try to read the HTML "
+                   "as rules).",
+            evidence={"status": robots_status},
+            how_to_fix="Serve a plain-text robots.txt (even an allow-all one) that names your "
+                       "sitemap."))
+    elif robots_state == "missing":
         findings.append(Finding(
             severity="info", category="Site Hygiene",
             title="No robots.txt", url=root + "/robots.txt",
@@ -127,6 +156,7 @@ def discover_sitemap_urls(request, base_url: str, cfg: Config,
 
     candidates = sitemap_refs or [root + "/sitemap.xml", root + "/sitemap_index.xml"]
     found_any = False
+    sitemap_html = False                    # answered 200, but with the site's HTML page
     sitemap_blocked: Optional[int] = None   # a refusal, not a 404: we could not look
     for sm in candidates[:5]:
         resp = fetch(request, sm)
@@ -138,6 +168,9 @@ def discover_sitemap_urls(request, base_url: str, cfg: Config,
         try:
             xml = resp.text()
         except Exception:
+            continue
+        if _is_html(resp, xml) or not re.search(r"<(urlset|sitemapindex)\b", xml, re.I):
+            sitemap_html = True
             continue
         found_any = True
         locs = re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", xml, re.I)
@@ -157,7 +190,9 @@ def discover_sitemap_urls(request, base_url: str, cfg: Config,
         findings.append(Finding(
             severity="low", category="Site Hygiene",
             title="No sitemap.xml found", url=root + "/sitemap.xml",
-            detail="Search engines have to discover pages by crawling links only.",
+            detail="Search engines have to discover pages by crawling links only."
+                   + (" The address answers 200 with the site's normal HTML page, not a sitemap."
+                      if sitemap_html else ""),
             how_to_fix="Publish a sitemap.xml and link it from robots.txt."))
     elif not found_any and sitemap_blocked and not blocked:
         findings.append(Finding(
@@ -323,7 +358,9 @@ def cross_page_checks(pages: List[Any]) -> List[Finding]:
     by_title: Dict[str, List[str]] = defaultdict(list)
     for p in pages:
         if p.title and p.status and p.status < 400:
-            by_title[p.title.strip()].append(p.url)
+            urls = by_title[p.title.strip()]
+            if p.url not in urls:          # a page seen as visitor and signed in counts once
+                urls.append(p.url)
     for title, urls in by_title.items():
         if len(urls) > 1:
             out.append(Finding(

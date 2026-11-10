@@ -16,7 +16,7 @@ from .intelligence import Intelligence
 from .linkgraph import LinkGraph
 from .config import Config
 from .dom_probe import DOM_PROBE
-from .interact import WIDE_ELEMENTS_JS, click_everything, test_forms
+from .interact import OVERFLOW_JS, WIDE_ELEMENTS_JS, click_everything, test_forms
 from .models import Finding, PageResult, SEVERITY_WEIGHT
 from .recorder import Recorder
 from .urls import (is_asset, is_document, normalise, origin, same_scope, shorten)
@@ -59,6 +59,8 @@ class TesterBot:
         self.started = time.time()
         self.logged_in = False
         self.login_note = ""
+        self.landing_url: Optional[str] = None   # where the site sent us after logging in
+        self.entry_done = False                  # the start page's once-only checks have run
         self.page = None
         self.out_dir = os.path.abspath(cfg.out_dir)
         self.shot_dir = os.path.join(self.out_dir, "screenshots")
@@ -161,24 +163,11 @@ class TesterBot:
                 self.add(sm_findings)
                 seeds = sm_urls[: cfg.max_pages]
 
-            # ---------- login
-            if cfg.username or cfg.password:
-                self.log("→ logging in")
-                ok, lf, note = auth.login(page, cfg, self.base_url)
-                self.add(lf)
-                self.logged_in, self.login_note = ok, note
-                self.log(f"   {note}")
-                if ok and cfg.save_storage_state:
-                    try:
-                        context.storage_state(path=cfg.save_storage_state)
-                        self.log(f"   session saved to {cfg.save_storage_state}")
-                    except Exception:
-                        pass
-            elif cfg.storage_state:
-                self.logged_in = True
-                self.login_note = "restored from storage state"
-
             # ---------- crawl
+            # With a test login the site is walked twice: first as a visitor (the
+            # public pages, the sign-up and password pages), then signed in (the
+            # area behind the login). Each walk gets part of the page budget.
+            login_wanted = bool(cfg.username or cfg.password)
             queue: deque = deque()
             queue.append((self.base_url, 0))
             for u in cfg.extra_urls:
@@ -189,20 +178,56 @@ class TesterBot:
                 queue.append((u, 1))
             visited: Set[str] = set()
 
-            while queue and len(visited) < cfg.max_pages:
-                url, depth = queue.popleft()
-                if url in visited or depth > cfg.max_depth:
-                    continue
-                reason = self.should_visit(url)
-                if reason and url != self.base_url:
-                    continue
-                visited.add(url)
-                self.log(f"[{len(visited)}/{cfg.max_pages}] depth {depth} · {shorten(url, 90)}")
-                new_links = self.process_page(page, rec, url, depth,
-                                              is_entry=(url == self.base_url))
-                for link in new_links:
-                    if link not in visited and self.should_visit(link) is None:
-                        queue.append((link, depth + 1))
+            if cfg.storage_state and not login_wanted:
+                self.logged_in = True
+                self.login_note = "restored from storage state"
+            if cfg.login_problem and not login_wanted:
+                self.login_note = "login not done: " + cfg.login_problem[:200]
+                self.log(f"   ⚠ {self.login_note}")
+                self.add([Finding(
+                    severity="high", category="Authentication",
+                    title="A login was asked for but could not be done",
+                    detail=cfg.login_problem[:600] + " Only the pages a visitor sees without "
+                           "signing in were tested.",
+                    url=self.base_url,
+                    how_to_fix="Start the test again. If it keeps happening, the test machine "
+                               "could not reach the TesterBot site to collect the login.")])
+
+            if login_wanted:
+                self.log("→ as a visitor first")
+                self._crawl(page, rec, queue, visited, max(1, cfg.max_pages // 2))
+                self.log("→ logging in")
+                ok, lf, note = auth.login(page, cfg, self.base_url)
+                if not ok and lf:
+                    shot = self.shot("login-failed")
+                    for f in lf:
+                        if f.category == "Authentication" and not f.screenshot:
+                            f.screenshot = shot
+                            break
+                self.add(lf)
+                self.logged_in, self.login_note = ok, note
+                self.log(f"   {note}")
+                if ok:
+                    if cfg.save_storage_state:
+                        try:
+                            context.storage_state(path=cfg.save_storage_state)
+                            self.log(f"   session saved to {cfg.save_storage_state}")
+                        except Exception:
+                            pass
+                    landing = normalise(page.url, self.base_url)
+                    queue, visited = deque([(self.base_url, 0)]), set()
+                    if landing and landing != self.base_url and self.should_visit(landing) is None:
+                        self.landing_url = landing     # often the dashboard: test it first
+                        queue.appendleft((landing, 0))
+                    for u in cfg.extra_urls:
+                        n = normalise(u, self.base_url)
+                        if n:
+                            queue.append((n, 1))
+                    self.log("→ signed in")
+                # signed in: walk again; login failed: carry on as a visitor
+                self._crawl(page, rec, queue, visited, cfg.max_pages - len(self.pages))
+            else:
+                self._crawl(page, rec, queue, visited, cfg.max_pages)
 
             # ---------- link health
             if self.links:
@@ -225,12 +250,35 @@ class TesterBot:
 
         return self.build_report()
 
+    def _crawl(self, page, rec: Recorder, queue: deque, visited: Set[str], budget: int) -> None:
+        """Visit pages from the queue, breadth first, until `budget` pages are done."""
+        cfg = self.cfg
+        done = 0
+        while queue and done < budget:
+            url, depth = queue.popleft()
+            if url in visited or depth > cfg.max_depth:
+                continue
+            reason = self.should_visit(url)
+            if reason and url != self.base_url:
+                continue
+            visited.add(url)
+            done += 1
+            self.log(f"[{len(self.pages) + 1}/{cfg.max_pages}] depth {depth}"
+                     f"{' · signed in' if self.logged_in else ''} · {shorten(url, 90)}")
+            first = url == self.base_url and not self.entry_done
+            if first:
+                self.entry_done = True
+            new_links = self.process_page(page, rec, url, depth, is_entry=first)
+            for link in new_links:
+                if link not in visited and self.should_visit(link) is None:
+                    queue.append((link, depth + 1))
+
     # ------------------------------------------------------------- one page
     def process_page(self, page, rec: Recorder, url: str, depth: int,
                      is_entry: bool) -> List[str]:
         cfg = self.cfg
         rec.reset()
-        result = PageResult(url=url, depth=depth)
+        result = PageResult(url=url, depth=depth, signed_in=self.logged_in)
         found_links: List[str] = []
         before = len(self.findings)
 
@@ -252,6 +300,15 @@ class TesterBot:
             pass
         page.wait_for_timeout(cfg.settle_ms)
 
+        # how much text the server itself sends, before any JavaScript (entry page)
+        server_chars: Optional[int] = None
+        if is_entry and response is not None:
+            try:
+                if "html" in (response.headers.get("content-type") or "").lower():
+                    server_chars = audits.visible_text_len(response.text())
+            except Exception:
+                server_chars = None
+
         headers: Dict[str, str] = {}
         if response is not None:
             result.status = response.status
@@ -267,7 +324,8 @@ class TesterBot:
             return found_links
 
         # session lost?
-        if self.logged_in and auth.is_logged_out(page) and url != cfg.login_url:
+        if self.logged_in and url != cfg.login_url and \
+                auth.is_logged_out(page, url, cfg.login_url):
             self.log("   session appears lost - logging in again")
             ok, _lf, _n = auth.login(page, cfg, self.base_url)
             if ok:
@@ -290,10 +348,14 @@ class TesterBot:
 
         if data:
             self.add(audits.audit_dom(url, data, cfg, is_entry))
+            if is_entry:
+                self.add(audits.audit_rendering(url, server_chars,
+                                                int(data.get("bodyTextLength") or 0)))
 
         # ---- console / network
         self.add(audits.audit_console(url, rec.console, rec.page_errors))
-        self.add(audits.audit_network(url, rec.failed, rec.bad_responses()))
+        self.add(audits.audit_network(url, rec.failed, rec.bad_responses(),
+                                      logged_in=self.logged_in))
 
         # ---- performance
         try:
@@ -348,43 +410,85 @@ class TesterBot:
             result.screenshot = self.shot(f"page-{slug(url.split('/')[-1] or 'home')}", full=True)
 
         # ---- interactions
+        reached: List[str] = []         # pages that clicks led to (menus made of buttons/divs)
         if cfg.click_elements and data.get("clickables"):
             f, clicked = click_everything(page, cfg, rec, url, data["clickables"],
-                                          self.tested_controls, self._shot_factory())
+                                          self.tested_controls, self._shot_factory(),
+                                          logged_in=self.logged_in, discovered=reached)
             self.add(f)
             result.buttons_clicked = clicked
         if data.get("forms"):
+            # with a test login in play, password forms are never sent made-up data:
+            # that could change the account's password, end the session, or trip
+            # the site's lock-out before the real login
             f, n_forms = test_forms(page, cfg, rec, url, data["forms"],
-                                    self.tested_forms, self._shot_factory())
+                                    self.tested_forms, self._shot_factory(),
+                                    logged_in=self.logged_in or bool(cfg.username or cfg.password))
             self.add(f)
             result.forms_tested = n_forms
 
         result.findings = len(self.findings) - before
         self.pages.append(result)
+        for u in reached:
+            n = normalise(u, url)
+            if n and n not in found_links:
+                found_links.append(n)
         return found_links
 
     # ------------------------------------------------------------- responsive
+    def _overflow(self, page, width: int) -> Optional[Dict[str, Any]]:
+        """The page's measurements if it is wider than the screen and lets the user
+        scroll sideways; None otherwise."""
+        m = page.evaluate(OVERFLOW_JS) or {}
+        if m.get("clipped") or (m.get("scrollWidth") or 0) <= width + 4:
+            return None
+        return m
+
+    def _settle_load(self, page) -> None:
+        try:
+            page.wait_for_load_state("networkidle", timeout=6000)
+        except Exception:
+            pass
+        page.wait_for_timeout(self.cfg.settle_ms)
+
     def check_responsive(self, page, url: str) -> None:
         cfg = self.cfg
+        reloaded = False
         for label, w, h in (("mobile", cfg.mobile_width, cfg.mobile_height),
                             ("tablet", cfg.tablet_width, cfg.tablet_height)):
             try:
                 page.set_viewport_size({"width": w, "height": h})
                 page.wait_for_timeout(450)
-                metrics = page.evaluate(
-                    "() => ({scrollWidth: document.documentElement.scrollWidth,"
-                    " clientWidth: document.documentElement.clientWidth})")
-                if metrics.get("scrollWidth", 0) > w + 4:
-                    metrics["wide"] = page.evaluate(WIDE_ELEMENTS_JS, w)
-                    shot = self.shot(f"{label}-overflow")
-                    self.add(audits.audit_responsive(url, label, w, metrics, shot))
-                elif cfg.screenshot_all and label == "mobile":
-                    self.shot("mobile-view")
+                if not self._overflow(page, w):
+                    if cfg.screenshot_all and label == "mobile":
+                        self.shot("mobile-view")
+                    continue
+                # Shrinking a desktop window can leave a layout too wide for a moment
+                # (sliders and scripts measure again late). A phone opens the page at
+                # its own width and never sees that, so look again the way a phone
+                # would - after a fresh load at this width - before reporting anything.
+                page.wait_for_timeout(900)
+                if not self._overflow(page, w):
+                    continue
+                reloaded = True
+                page.reload(timeout=cfg.nav_timeout_ms, wait_until="domcontentloaded")
+                self._settle_load(page)
+                metrics = self._overflow(page, w)
+                if not metrics:
+                    continue
+                metrics["wide"] = page.evaluate(WIDE_ELEMENTS_JS, w)
+                metrics["reloaded"] = True
+                shot = self.shot(f"{label}-overflow")
+                self.add(audits.audit_responsive(url, label, w, metrics, shot))
             except Exception:
                 continue
         try:
             page.set_viewport_size({"width": cfg.viewport_width, "height": cfg.viewport_height})
-            page.wait_for_timeout(250)
+            if reloaded:        # back to the desktop layout before anything is clicked
+                page.reload(timeout=cfg.nav_timeout_ms, wait_until="domcontentloaded")
+                self._settle_load(page)
+            else:
+                page.wait_for_timeout(250)
         except Exception:
             pass
 
@@ -425,6 +529,9 @@ class TesterBot:
                 "screenshots": self.shots,
                 "logged_in": self.logged_in,
                 "login_note": self.login_note,
+                "login_attempted": bool(self.cfg.username or self.cfg.password
+                                        or self.cfg.login_problem),
+                "login_user": self.cfg.username if (self.cfg.username or self.cfg.password) else "",
                 "danger_mode": self.cfg.danger_mode,
                 "config": self.cfg.to_public_dict(),
                 "version": __import__("testerbot").__version__,

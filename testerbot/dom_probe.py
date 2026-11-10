@@ -200,8 +200,155 @@ DOM_PROBE = r"""
     };
   });
 
+  // ---- the words a visitor reads next to a field
+  function labelText(el) {
+    let t = '';
+    if (el.id) {
+      const l = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+      if (l) t = txt(l);
+    }
+    if (!t) { const l = el.closest('label'); if (l) t = txt(l); }
+    if (!t) t = (el.getAttribute('aria-label') || '').trim();
+    if (!t && el.getAttribute('aria-labelledby')) {
+      t = el.getAttribute('aria-labelledby').split(/\s+/).map(id => {
+        const n = document.getElementById(id); return n ? txt(n) : '';
+      }).join(' ').trim();
+    }
+    return t;
+  }
+  // a <label> sitting next to the field without being connected to it
+  function nearLabel(el) {
+    let box = el.parentElement;
+    for (let i = 0; i < 3 && box; i++, box = box.parentElement) {
+      const fields = Array.from(box.querySelectorAll('input,select,textarea')).filter(c =>
+        !['hidden', 'submit', 'button', 'reset', 'image'].includes((c.type || '').toLowerCase()));
+      if (fields.length > 1) return '';
+      const l = box.querySelector('label');
+      if (l) return txt(l);
+    }
+    return '';
+  }
+
+  // ---- contact links that show one address but open another
+  const EMAIL_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/ig;
+  const digits = s => (s || '').replace(/[^0-9]/g, '');
+  out.contactMismatch = [];
+  for (const a of document.querySelectorAll('a[href^="mailto:" i], a[href^="tel:" i]')) {
+    if (out.contactMismatch.length >= 20) break;
+    const href = a.getAttribute('href') || '';
+    const shown = txt(a);
+    if (/^mailto:/i.test(href)) {
+      let target = href.slice(7).split('?')[0];
+      try { target = decodeURIComponent(target); } catch (e) {}
+      const targets = target.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+      let seen = (shown.match(EMAIL_RE) || []).map(e => e.toLowerCase());
+      if (!seen.length && a.parentElement) {
+        const around = (txt(a.parentElement).match(EMAIL_RE) || []).map(e => e.toLowerCase());
+        if (around.length === 1) seen = around;
+      }
+      const wrong = seen.filter(e => !targets.includes(e));
+      if (targets.length && wrong.length) {
+        out.contactMismatch.push({ kind: 'email', shown: wrong[0], opens: targets.join(', '),
+                                   text: cut(shown, 80), selector: selectorFor(a) });
+      }
+    } else {
+      const linked = digits(href.slice(4)), seen = digits(shown);
+      if (seen.length >= 7 && linked.length >= 7 && linked.slice(-7) !== seen.slice(-7)) {
+        out.contactMismatch.push({ kind: 'phone', shown: cut(shown, 40), opens: href.slice(4),
+                                   text: cut(shown, 80), selector: selectorFor(a) });
+      }
+    }
+  }
+
+  // ---- things that react to a click but are neither links nor buttons:
+  // a mouse can use them, a keyboard cannot reach them at all
+  const NATIVE = 'a[href],button,input,select,textarea,summary,label,details,option,iframe,video,audio';
+  const ROLE_OK = /^(button|link|tab|menuitem|menuitemcheckbox|menuitemradio|option|checkbox|radio|switch|treeitem|gridcell|row)$/;
+  out.clickTraps = [];
+  const trapEls = [];
+  for (const el of document.querySelectorAll('body *')) {
+    if (out.clickTraps.length >= 40) break;
+    if (!(typeof el.onclick === 'function' || el.hasAttribute('onclick'))) continue;
+    if (el.matches(NATIVE) || el.closest('a[href],button')) continue;
+    const ti = el.getAttribute('tabindex');
+    if (ti !== null && parseInt(ti, 10) >= 0) continue;
+    const role = (el.getAttribute('role') || '').toLowerCase();
+    if (ROLE_OK.test(role) && ti === '-1') continue;          // focus managed by its widget
+    if (el.querySelector('a[href],button,input,select,textarea')) continue;  // just a wrapper
+    if (trapEls.some(p => p.contains(el))) continue;
+    if (!visible(el) || getComputedStyle(el).cursor !== 'pointer') continue;
+    const t = cut(txt(el), 60);
+    if (!t && !el.querySelector('img,svg')) continue;
+    trapEls.push(el);
+    out.clickTraps.push({ text: t, tag: el.tagName.toLowerCase(), selector: selectorFor(el) });
+  }
+
+  // ---- a field labelled "optional" that the form nevertheless requires
+  out.optionalRequired = [];
+  for (const el of controls) {
+    if (!visible(el)) continue;
+    if (!(el.required || el.getAttribute('aria-required') === 'true')) continue;
+    const t = labelText(el) || nearLabel(el) || (el.getAttribute('placeholder') || '');
+    if (/\boptional\b|\(opt\.?\)|isteğe bağlı|ixtiyari|məcburi deyil|необязательн/i.test(t)) {
+      out.optionalRequired.push({ label: cut(t, 80), name: el.getAttribute('name') || el.id || '',
+                                  selector: selectorFor(el) });
+    }
+  }
+
+  // ---- labels pointing at a field id that does not exist
+  out.labelsOrphaned = [];
+  for (const l of document.querySelectorAll('label[for]')) {
+    if (out.labelsOrphaned.length >= 20) break;
+    const f = l.getAttribute('for');
+    if (!f || document.getElementById(f) || !visible(l)) continue;
+    let field = null, box = l.parentElement;
+    for (let i = 0; i < 3 && box && !field; i++, box = box.parentElement) {
+      const cs = Array.from(box.querySelectorAll('input,select,textarea')).filter(c =>
+        !['hidden', 'submit', 'button', 'reset', 'image'].includes((c.type || '').toLowerCase()) && visible(c));
+      if (cs.length === 1) field = cs[0];
+      else if (cs.length > 1) break;
+    }
+    out.labelsOrphaned.push({ label: cut(txt(l), 60), points_to: f,
+                              field_id: field ? (field.id || '') : '',
+                              field: field ? selectorFor(field) : '' });
+  }
+
+  // ---- personal-data fields that give the browser no autocomplete hint
+  const PERSONAL = /(e-?mail|user ?name|login|phone|mobile|first.?name|last.?name|full.?name|surname|given.?name|family.?name|address|post.?code|zip|city|country)/i;
+  out.noAutocomplete = [];
+  for (const el of controls) {
+    if (out.noAutocomplete.length >= 20) break;
+    if (!visible(el) || el.hasAttribute('autocomplete')) continue;
+    const t = (el.type || '').toLowerCase();
+    const blob = [el.getAttribute('name'), el.id, el.getAttribute('placeholder'), labelText(el)].join(' ');
+    if (t === 'email' || t === 'password' || t === 'tel' || (t === 'text' && PERSONAL.test(blob))) {
+      out.noAutocomplete.push({ type: t, name: el.getAttribute('name') || el.id || cut(labelText(el), 40),
+                                selector: selectorFor(el) });
+    }
+  }
+
+  // ---- text for the spelling check: everything visible, plus the short
+  // strings visitors read first (menus, buttons, links, headings, labels)
+  out.text = bodyText.slice(0, 60000);
+  const ui = new Set();
+  const uiSel = "a,button,[role='button'],[role='menuitem'],[role='tab'],[role='link'],label,summary," +
+                "legend,h1,h2,h3,h4,h5,h6,nav li,th";
+  for (const el of document.querySelectorAll(uiSel)) {
+    if (ui.size >= 600) break;
+    if (!visible(el)) continue;
+    const t = txt(el);
+    if (t && t.length <= 80) ui.add(t);
+  }
+  for (const c of out.clickTraps) if (c.text) ui.add(c.text);
+  for (const el of document.querySelectorAll('[placeholder]')) {
+    if (ui.size >= 700) break;
+    if (visible(el)) ui.add((el.getAttribute('placeholder') || '').trim().slice(0, 80));
+  }
+  out.uiText = Array.from(ui).filter(Boolean);
+
   // clickable candidates (non-link interactive things)
   const cand = new Set();
+  for (const el of trapEls) cand.add(el);          // menus built from divs get clicked too
   const sels = ["button", "[role='button']", "[role='tab']", "[role='menuitem']", "summary",
                 "[onclick]", "[data-toggle]", "[data-bs-toggle]", "[data-testid*='button' i]",
                 ".btn", ".button", "[class*='dropdown-toggle' i]", "[class*='accordion' i]",

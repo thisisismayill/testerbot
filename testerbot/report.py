@@ -24,7 +24,12 @@ def _pretty(value: Any) -> str:
 
 
 def _meta_grid(meta: Dict[str, Any]) -> str:
-    login = ("yes — " + esc(meta.get("login_note", ""))) if meta.get("logged_in") else "no"
+    if meta.get("logged_in"):
+        login = "yes — " + esc(meta.get("login_note", ""))
+    elif meta.get("login_attempted"):
+        login = "no — " + esc(meta.get("login_note") or "the login did not work")
+    else:
+        login = "no (public pages only)"
     items = [
         ("Generated", meta["generated_at"]),
         ("Duration", f"{meta['duration_s']}s"),
