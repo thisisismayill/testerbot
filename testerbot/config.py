@@ -112,8 +112,27 @@ class Config:
         r"\.(zip|rar|7z|tar|gz|exe|dmg|pkg|msi|iso|mp4|mp3|avi|mov|wav|apk)$",
     ]
 
+    # Money words that are only risky as a command ("Pay now", "Buy"). Next to a
+    # word for reading ("Payment history", "How do I get the payment?") they open
+    # a page, so the control is clicked like any other. Hard words (delete,
+    # withdraw, log out …) are never relaxed.
+    SOFT_DANGER = {"pay", "payment", "buy", "purchase", "donate"}
+    READING_CONTEXT = re.compile(
+        r"\b(history|how|what|when|where|why|faq|info|information|details|statistics|stats|"
+        r"reports?|terms|polic(y|ies)|methods?|options?|overview|list|status)\b|\?", re.I)
+
     def danger_re(self) -> re.Pattern:
         return re.compile("|".join(self.DANGER_WORDS), re.I)
+
+    def is_dangerous(self, text: str, html: str = "") -> bool:
+        """Would clicking a control with this visible text (and markup) risk real damage?"""
+        rx = self.danger_re()
+        hits = [m.group(0).strip().lower() for m in rx.finditer(f"{text} {html}")]
+        if not hits:
+            return False
+        if all(h in self.SOFT_DANGER for h in hits) and self.READING_CONTEXT.search(text or ""):
+            return False
+        return True
 
     def skip_url_re(self) -> re.Pattern:
         return re.compile("|".join(self.SKIP_URL_PATTERNS), re.I)

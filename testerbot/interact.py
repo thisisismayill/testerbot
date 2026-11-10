@@ -10,16 +10,57 @@ from .models import Finding
 from .recorder import Recorder
 
 FINGERPRINT_JS = """
-() => ({
-  url: location.href,
-  html: document.body ? document.body.innerHTML.length : 0,
-  text: document.body ? (document.body.innerText || '').length : 0,
-  dialogs: document.querySelectorAll(
-    "[role='dialog'],dialog[open],.modal.show,.modal.in,[aria-modal='true'],.offcanvas.show").length,
-  scrollY: Math.round(window.scrollY),
-  focus: document.activeElement ? document.activeElement.tagName : ''
-})
+() => {
+  // a hash of the whole page, so a swapped class ("selected" moving to another
+  // tab) or a redrawn chart counts as a change even when the length stays equal
+  const s = document.body ? document.body.innerHTML : '';
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  let canvas = '';
+  for (const c of Array.from(document.querySelectorAll('canvas')).slice(0, 4)) {
+    try { canvas += c.toDataURL().length + ','; } catch (e) {}
+  }
+  return {
+    url: location.href,
+    copies: window.__tbCopies || 0,
+    html: s.length,
+    hash: (h >>> 0) + '|' + canvas,
+    text: document.body ? (document.body.innerText || '').length : 0,
+    dialogs: document.querySelectorAll(
+      "[role='dialog'],dialog[open],.modal.show,.modal.in,[aria-modal='true'],.offcanvas.show").length,
+    scrollY: Math.round(window.scrollY),
+    focus: document.activeElement ? document.activeElement.tagName : ''
+  };
+}
 """
+
+# Counts copy-to-clipboard calls (they pass straight through), so a copy button
+# is not mistaken for a control that does nothing. Added to every page.
+COPY_WATCH_JS = """
+(() => {
+  const note = () => { window.__tbCopies = (window.__tbCopies || 0) + 1; };
+  try {
+    const c = navigator.clipboard;
+    if (c && c.writeText) { const w = c.writeText.bind(c); c.writeText = (t) => { note(); return w(t); }; }
+    if (c && c.write) { const w2 = c.write.bind(c); c.write = (d) => { note(); return w2(d); }; }
+    const ex = document.execCommand.bind(document);
+    document.execCommand = function (cmd, ...rest) {
+      if (String(cmd).toLowerCase() === 'copy') note();
+      return ex(cmd, ...rest);
+    };
+  } catch (e) {}
+})();
+"""
+
+# Copy buttons call the clipboard. The test browser is not a person at a
+# focused window, so the browser may refuse - an artefact of the test, not a bug.
+CLIPBOARD_REFUSED = re.compile(r"clipboard", re.I)
+CLIPBOARD_WHY = re.compile(r"permission|denied|not ?allowed|not focused|focus", re.I)
+
+
+def is_clipboard_refusal(message: str) -> bool:
+    return bool(CLIPBOARD_REFUSED.search(message or "") and CLIPBOARD_WHY.search(message or ""))
+
 
 WIDE_ELEMENTS_JS = """
 (vw) => {
@@ -49,7 +90,7 @@ WIDE_ELEMENTS_JS = """
     if (c) sel += '.' + c;
     listed.push(el);
     out.push({ selector: sel, width: Math.round(r.width), right: Math.round(r.right + sx),
-               text: (el.innerText || '').trim().slice(0, 60) });
+               text: (el.innerText || '').trim().split('\\n')[0].slice(0, 40) });
     if (out.length > 12) break;
   }
   return out;
@@ -89,8 +130,16 @@ def click_everything(page, cfg: Config, rec: Recorder, url: str,
     Pages a click leads to are added to `discovered`, so menus built from buttons
     or divs (common in single-page apps) still get their pages tested."""
     findings: List[Finding] = []
-    danger = cfg.danger_re()
     clicked = 0
+    # A page that changes by itself (clocks, carousels, live counters) would make
+    # every click look effective; on such a page fall back to coarser signals.
+    first, again = _fingerprint(page), None
+    try:
+        page.wait_for_timeout(300)
+        again = _fingerprint(page)
+    except Exception:
+        pass
+    restless = bool(again) and first.get("hash") != again.get("hash")
 
     for item in clickables:
         if clicked >= cfg.max_clicks_per_page:
@@ -106,8 +155,7 @@ def click_everything(page, cfg: Config, rec: Recorder, url: str,
                 and item.get("tag") in ("button", "input"):
             tested.add(sig)          # the form engine submits this properly
             continue
-        blob = f"{text} {item.get('html', '')}"
-        if not cfg.danger_mode and danger.search(blob):
+        if not cfg.danger_mode and cfg.is_dangerous(text, item.get("html", "")):
             tested.add(sig)
             findings.append(Finding(
                 severity="info", category="Skipped",
@@ -163,16 +211,33 @@ def click_everything(page, cfg: Config, rec: Recorder, url: str,
         delta = rec.delta(mark)
         after = _fingerprint(page)
         navigated = after.get("url") != before.get("url")
+        copied = (after.get("copies") or 0) > (before.get("copies") or 0)
         new_popup = len(rec.popups) > popups_before
         new_download = len(rec.downloads) > downloads_before
         dom_changed = (abs(after.get("html", 0) - before.get("html", 0)) > 12
                        or abs(after.get("text", 0) - before.get("text", 0)) > 6
                        or after.get("dialogs", 0) != before.get("dialogs", 0)
-                       or abs(after.get("scrollY", 0) - before.get("scrollY", 0)) > 30)
+                       or abs(after.get("scrollY", 0) - before.get("scrollY", 0)) > 30
+                       or (not restless and after.get("hash") != before.get("hash")))
         net_activity = any(r["resource_type"] in ("xhr", "fetch", "document")
                            for r in delta["responses"])
 
         for err in delta["page_errors"]:
+            if is_clipboard_refusal(err.get("message", "")):
+                findings.append(Finding(
+                    severity="info", category="Interaction",
+                    title="A copy button could not be checked (the test browser has no clipboard)",
+                    detail=f"Clicking '{text[:45] or item['tag']}' tries to copy to the clipboard, "
+                           "and the test browser refused. A visitor who clicks it is normally "
+                           "allowed, so this is not a fault of the site - but the page does not "
+                           "catch the refusal, so on a browser that blocks the clipboard the "
+                           "button silently does nothing. Worth one manual click.",
+                    url=url, element=item.get("selector"),
+                    evidence={"message": err["message"][:300],
+                              "control_html": item.get("html", "")[:200]},
+                    how_to_fix="Optionally catch the error of navigator.clipboard.writeText() "
+                               "and show 'Copy failed - select the text instead'."))
+                continue
             findings.append(Finding(
                 severity="critical", category="JavaScript Error",
                 title=f"Clicking '{text[:45] or item['tag']}' throws: {err['message'][:80]}",
@@ -191,7 +256,7 @@ def click_everything(page, cfg: Config, rec: Recorder, url: str,
                     detail="The request triggered by this control failed on the server.",
                     url=url, element=item.get("selector"),
                     evidence={"request": resp["url"], "status": resp["status"],
-                              "method": resp.get("method")},
+                              "method": resp.get("method"), "response": rec.body_of(resp)},
                     how_to_fix="Check the server logs for this endpoint."))
             elif resp["status"] in (401, 403, 404) and resp["resource_type"] in ("xhr", "fetch"):
                 if not logged_in and is_auth_probe(resp):
@@ -200,9 +265,12 @@ def click_everything(page, cfg: Config, rec: Recorder, url: str,
                     severity="high", category="Network",
                     title=f"Clicking '{text[:40] or item['tag']}' calls a "
                           f"{resp['status']} endpoint",
-                    detail="The API call behind this control does not succeed.",
+                    detail="The API call behind this control does not succeed."
+                           + (f" The server answered: {rec.body_of(resp)[:200]}"
+                              if rec.body_of(resp) else ""),
                     url=url, element=item.get("selector"),
-                    evidence={"request": resp["url"], "status": resp["status"]}))
+                    evidence={"request": resp["url"], "status": resp["status"],
+                              "response": rec.body_of(resp)}))
         for dlg in delta["dialogs"]:
             findings.append(Finding(
                 severity="low", category="UX",
@@ -213,7 +281,7 @@ def click_everything(page, cfg: Config, rec: Recorder, url: str,
                 url=url, element=item.get("selector"),
                 how_to_fix="Replace alert()/confirm() with an in-page dialog component."))
 
-        if not (navigated or dom_changed or net_activity or new_popup or new_download
+        if not (navigated or dom_changed or net_activity or new_popup or new_download or copied
                 or delta["dialogs"] or delta["page_errors"]):
             findings.append(Finding(
                 severity="low", category="Dead Control",

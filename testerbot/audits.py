@@ -43,6 +43,9 @@ def audit_console(url: str, console_msgs: List[Dict[str, Any]],
                   page_errors: List[Dict[str, Any]]) -> List[Finding]:
     out: List[Finding] = []
     for err in page_errors:
+        msg = err.get("message", "")
+        if re.search(r"clipboard", msg, re.I) and re.search(r"permission|denied|not ?allowed|focus", msg, re.I):
+            continue        # the test browser has no clipboard; a visitor's browser does
         out.append(Finding(
             severity="critical", category="JavaScript Error",
             title=f"Uncaught JS exception: {err['message'][:110]}",
@@ -85,7 +88,8 @@ def audit_console(url: str, console_msgs: List[Dict[str, Any]],
 # ---------------------------------------------------------------- network
 
 def audit_network(url: str, failed: List[Dict[str, Any]],
-                  bad_responses: List[Dict[str, Any]], logged_in: bool = False) -> List[Finding]:
+                  bad_responses: List[Dict[str, Any]], logged_in: bool = False,
+                  body_of=None) -> List[Finding]:
     out: List[Finding] = []
     if not logged_in:
         probes = [r for r in bad_responses if is_auth_probe(r)]
@@ -118,16 +122,21 @@ def audit_network(url: str, failed: List[Dict[str, Any]],
     for resp in bad_responses:
         status = resp["status"]
         sev = "critical" if status >= 500 else "high"
+        answer = body_of(resp) if body_of else ""
+        ev = {"request_url": resp["url"], "status": status,
+              "method": resp.get("method"), "resource_type": resp.get("resource_type")}
+        if answer:
+            ev["response"] = answer
         out.append(Finding(
             severity=sev, category="Network",
             title=f"HTTP {status} on {resp.get('resource_type', 'request')}: "
                   f"{shorten(resp['url'], 70)}",
             detail=f"A sub-request returned HTTP {status} while loading this page."
                    + (" A 5xx means the server itself errored."
-                      if status >= 500 else " The resource is missing or forbidden."),
+                      if status >= 500 else " The resource is missing or forbidden.")
+                   + (f" The server answered: {answer[:200]}" if answer else ""),
             url=url,
-            evidence={"request_url": resp["url"], "status": status,
-                      "method": resp.get("method"), "resource_type": resp.get("resource_type")},
+            evidence=ev,
             how_to_fix="Fix the endpoint or stop the page from requesting it.",
         ))
     return out

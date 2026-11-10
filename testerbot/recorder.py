@@ -1,6 +1,7 @@
 """Attaches to a Playwright page and records everything the browser reports."""
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -13,6 +14,7 @@ class Recorder:
         self.dialogs: List[Dict[str, Any]] = []
         self.popups: List[str] = []
         self.downloads: List[str] = []
+        self._errors: Dict[Any, Any] = {}     # (url, status) -> failed API response
         self._page = None
 
     # -- lifecycle -----------------------------------------------------
@@ -36,6 +38,7 @@ class Recorder:
         self.dialogs.clear()
         self.popups.clear()
         self.downloads.clear()
+        self._errors.clear()
 
     # -- handlers ------------------------------------------------------
     def _on_console(self, msg) -> None:
@@ -84,6 +87,9 @@ class Recorder:
                 "resource_type": response.request.resource_type,
                 "size": size,
             })
+            if response.status >= 400 and response.request.resource_type in ("xhr", "fetch"):
+                if len(self._errors) < 60:
+                    self._errors[(response.url, response.status)] = response
         except Exception:
             pass
 
@@ -139,6 +145,19 @@ class Recorder:
             seen.add(key)
             out.append(resp)
         return out
+
+    def body_of(self, resp: Dict[str, Any], limit: int = 300) -> str:
+        """The start of a failed API call's answer - it usually says what was wrong
+        ("date_from is required", "account not verified"). Tokens are blanked out."""
+        obj = self._errors.get((resp.get("url"), resp.get("status")))
+        if obj is None:
+            return ""
+        try:
+            text = obj.text()
+        except Exception:
+            return ""
+        text = re.sub(r"eyJ[\w-]+\.[\w-]+\.[\w-]*", "<token>", " ".join((text or "").split()))
+        return text[:limit]
 
     def weight_kb(self) -> float:
         return sum(r.get("size", 0) for r in self.responses) / 1024.0

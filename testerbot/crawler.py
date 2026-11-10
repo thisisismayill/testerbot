@@ -16,7 +16,7 @@ from .intelligence import Intelligence
 from .linkgraph import LinkGraph
 from .config import Config
 from .dom_probe import DOM_PROBE
-from .interact import OVERFLOW_JS, WIDE_ELEMENTS_JS, click_everything, test_forms
+from .interact import COPY_WATCH_JS, OVERFLOW_JS, WIDE_ELEMENTS_JS, click_everything, test_forms
 from .models import Finding, PageResult, SEVERITY_WEIGHT
 from .recorder import Recorder
 from .urls import (is_asset, is_document, normalise, origin, same_scope, shorten)
@@ -132,6 +132,15 @@ class TesterBot:
                 ctx_args["storage_state"] = cfg.storage_state
                 self.log(f"→ reusing saved session from {cfg.storage_state}")
             context = browser.new_context(**ctx_args)
+            try:    # a visitor's browser lets copy buttons use the clipboard; ours does too
+                context.grant_permissions(["clipboard-read", "clipboard-write"],
+                                          origin=origin(self.base_url))
+            except Exception:
+                pass
+            try:
+                context.add_init_script(COPY_WATCH_JS)
+            except Exception:
+                pass
             context.set_default_timeout(cfg.timeout_ms)
             context.set_default_navigation_timeout(cfg.nav_timeout_ms)
 
@@ -355,7 +364,7 @@ class TesterBot:
         # ---- console / network
         self.add(audits.audit_console(url, rec.console, rec.page_errors))
         self.add(audits.audit_network(url, rec.failed, rec.bad_responses(),
-                                      logged_in=self.logged_in))
+                                      logged_in=self.logged_in, body_of=rec.body_of))
 
         # ---- performance
         try:
